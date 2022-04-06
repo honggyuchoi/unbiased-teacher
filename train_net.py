@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
-
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
 from detectron2.config import get_cfg
 from detectron2.engine import default_argument_parser, default_setup, launch
 
 from ubteacher import add_ubteacher_config
-from ubteacher.engine.trainer import UBTeacherTrainer, BaselineTrainer
+from ubteacher.engine.trainer import (
+    UBTeacherTrainer, 
+    BaselineTrainer
+)
+from ubteacher.engine.mocov2trainer import MoCov2Trainer
+from ubteacher.engine.mocov1trainer import MoCov1Trainer
 
 # hacky way to register
 from ubteacher.modeling.meta_arch.rcnn import TwoStagePseudoLabGeneralizedRCNN
@@ -16,7 +22,6 @@ from ubteacher.modeling.roi_heads.roi_heads import StandardROIHeadsPseudoLab
 import ubteacher.data.datasets.builtin
 
 from ubteacher.modeling.meta_arch.ts_ensemble import EnsembleTSModel
-
 
 def setup(args):
     """
@@ -37,11 +42,19 @@ def main(args):
         Trainer = UBTeacherTrainer
     elif cfg.SEMISUPNET.Trainer == "baseline":
         Trainer = BaselineTrainer
+    # teacher - student only roi_heads
+    elif cfg.SEMISUPNET.Trainer == "mocov1":
+        Trainer = MoCov1Trainer
+    # teacher - student backbone to roi_heads 
+    elif cfg.SEMISUPNET.Trainer == "mocov2":
+        Trainer = MoCov2Trainer
     else:
         raise ValueError("Trainer Name is not found.")
 
     if args.eval_only:
-        if cfg.SEMISUPNET.Trainer == "ubteacher":
+        if cfg.SEMISUPNET.Trainer == "ubteacher" \
+            or cfg.SEMISUPNET.Trainer == "mocov2":
+            
             model = Trainer.build_model(cfg)
             model_teacher = Trainer.build_model(cfg)
             ensem_ts_model = EnsembleTSModel(model_teacher, model)

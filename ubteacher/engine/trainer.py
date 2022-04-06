@@ -21,13 +21,18 @@ from detectron2.structures.instances import Instances
 from detectron2.utils.env import TORCH_VERSION
 from detectron2.data import MetadataCatalog
 
+# additional 
+from detectron2.structures import pairwise_iou
+from detectron2.modeling.proposal_generator.proposal_utils import add_ground_truth_to_proposals
+
+
 from ubteacher.data.build import (
     build_detection_semisup_train_loader,
     build_detection_test_loader,
     build_detection_semisup_train_loader_two_crops,
 )
 from ubteacher.data.dataset_mapper import DatasetMapperTwoCropSeparate
-from ubteacher.engine.hooks import LossEvalHook
+from ubteacher.engine.hooks import LossEvalHook, BestCheckpointer
 from ubteacher.modeling.meta_arch.ts_ensemble import EnsembleTSModel
 from ubteacher.checkpoint.detection_checkpoint import DetectionTSCheckpointer
 from ubteacher.solver.build import build_lr_scheduler
@@ -177,6 +182,7 @@ class BaselineTrainer(DefaultTrainer):
 
     @classmethod
     def build_train_loader(cls, cfg):
+        # load only labeled data 
         return build_detection_semisup_train_loader(cfg, mapper=None)
 
     @classmethod
@@ -227,6 +233,15 @@ class BaselineTrainer(DefaultTrainer):
 
         if comm.is_main_process():
             ret.append(hooks.PeriodicWriter(self.build_writers(), period=20))
+            ret.append(
+                BestCheckpointer(
+                    cfg.TEST.EVAL_PERIOD, 
+                    self.checkpointer, 
+                    'bbox/AP', 
+                    'max', 
+                    'model_best'
+                )
+            )
         return ret
 
     def _write_metrics(self, metrics_dict: dict):
@@ -345,7 +360,14 @@ class UBTeacherTrainer(DefaultTrainer):
             output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
         evaluator_list = []
         evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
-
+        
+        if cfg.TEST.EVALUATOR == "coco":
+            evaluator_list.append(COCOEvaluator(
+                dataset_name, output_dir=output_folder))
+            return evaluator_list[0]
+        elif cfg.TEST.EVALUATOR == "voc":
+            return PascalVOCDetectionEvaluator(dataset_name)
+  
         if evaluator_type == "coco":
             evaluator_list.append(COCOEvaluator(
                 dataset_name, output_dir=output_folder))
@@ -534,11 +556,18 @@ class UBTeacherTrainer(DefaultTrainer):
             )
             joint_proposal_dict["proposals_pseudo_rpn"] = pesudo_proposals_rpn_unsup_k
             # Pseudo_labeling for ROI head (bbox location/objectness)
-            pesudo_proposals_roih_unsup_k, _ = self.process_pseudo_label(
+            pseudo_proposals_roih_unsup_k, _ = self.process_pseudo_label(
                 proposals_roih_unsup_k, cur_threshold, "roih", "thresholding"
             )
-            joint_proposal_dict["proposals_pseudo_roih"] = pesudo_proposals_roih_unsup_k
+            joint_proposal_dict["proposals_pseudo_roih"] = pseudo_proposals_roih_unsup_k
+            
 
+            num_pseudo_label = 0
+            for pseudo_label in pseudo_proposals_roih_unsup_k:
+                num_pseudo_label += pseudo_label.gt_classes.shape[0]
+            num_pseudo_label /= len(pseudo_proposals_roih_unsup_k)
+            self.storage.put_scalar("num_pseudo_label", num_pseudo_label)
+            
             #  add pseudo-label to unlabeled data
 
             unlabel_data_q = self.add_label(
@@ -716,4 +745,13 @@ class UBTeacherTrainer(DefaultTrainer):
         if comm.is_main_process():
             # run writers in the end, so that evaluation metrics are written
             ret.append(hooks.PeriodicWriter(self.build_writers(), period=20))
+            ret.append(
+                BestCheckpointer(
+                    cfg.TEST.EVAL_PERIOD, 
+                    self.checkpointer, 
+                    'bbox/AP', 
+                    'max', 
+                    'model_best'
+                )
+            )
         return ret

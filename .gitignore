@@ -1,0 +1,7 @@
+*.pkl
+*.pth
+*.png
+*jpg
+
+output/
+datasets/
