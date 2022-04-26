@@ -20,6 +20,7 @@ class PseudoLabRPN(RPN):
         gt_instances: Optional[Instances] = None,
         compute_loss: bool = True,
         compute_val_loss: bool = False,
+        split=None # split for unlabel_q / unlabel_k.
     ):
         features = [features[f] for f in self.in_features]
         anchors = self.anchor_generator(features)
@@ -42,9 +43,18 @@ class PseudoLabRPN(RPN):
 
         if (self.training and compute_loss) or compute_val_loss:
             gt_labels, gt_boxes = self.label_and_sample_anchors(anchors, gt_instances)
-            losses = self.losses(
-                anchors, pred_objectness_logits, gt_labels, pred_anchor_deltas, gt_boxes
-            )
+            if split is None:
+                losses = self.losses(
+                    anchors, pred_objectness_logits, gt_labels, pred_anchor_deltas, gt_boxes
+                )
+            else:
+                losses = self.losses(
+                    anchors,
+                    [pred_objectness_logit[:split] for pred_objectness_logit in pred_objectness_logits],
+                    gt_labels[:split],
+                    [pred_anchor_delta[:split] for pred_anchor_delta in pred_anchor_deltas],
+                    gt_boxes[:split] 
+                )
             losses = {k: v * self.loss_weight.get(k, 1.0) for k, v in losses.items()}
         else:  # inference
             losses = {}

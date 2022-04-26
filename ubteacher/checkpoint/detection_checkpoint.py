@@ -87,3 +87,13 @@ class DetectionTSCheckpointer(DetectionCheckpointer):
             unexpected_keys=incompatible.unexpected_keys,
             incorrect_shapes=incorrect_shapes,
         )
+
+    def _load_optimizer_scheduler(self, checkpoint, checkpointables=None):
+        for key in self.checkpointables if checkpointables is None else checkpointables:
+            if key in checkpoint:
+                self.logger.info("Loading {} ...".format(key))
+                obj = self.checkpointables[key]
+                obj.load_state_dict(checkpoint.pop(key))
+
+        # return any further checkpoint data
+        return checkpoint

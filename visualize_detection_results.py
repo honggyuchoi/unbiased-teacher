@@ -47,6 +47,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 import seaborn as sn
+from matplotlib.ticker import NullFormatter
 
 
 def setup(args):
@@ -86,7 +87,7 @@ def visualize_cosine_sim(cfg, model, datasets='coco'):
     output_dir = f'./visualize_cosine_mat'
     os.makedirs(output_dir, exist_ok=True)
     model_name =  cfg.MODEL.WEIGHTS
-    model_name = model_name.split('/')[-1]
+    model_name = model_name.split('/')[-2]
 
     global coco_names, voc_names
 
@@ -152,7 +153,7 @@ def visualize_cosine_sim(cfg, model, datasets='coco'):
     fig = plt.figure(figsize=(12, 9))
     sn.set(font_scale=1.0 if num_classes < 50 else 0.8)  # for label size
     labels = (0 < len(names) < 99) and len(names) == num_classes  # apply names to ticklabels
-    sn.heatmap(cosine_sim_mat, vmin=-1.0, vmax=1.0, annot=num_classes < 30, annot_kws={"size": 8}, cmap='Blues', fmt='.2f', square=True,
+    sn.heatmap(cosine_sim_mat, vmin=0.0, vmax=1.0, annot=num_classes < 30, annot_kws={"size": 8}, cmap='Blues', fmt='.2f', square=True,
                 xticklabels=names,
                 yticklabels=names).set_facecolor((1, 1, 1))
     fig.tight_layout()
@@ -270,10 +271,7 @@ def visualize_confusion_mat(cfg, model, datasets='coco', score_threshold=0.1, io
     fig.tight_layout()
     fig.savefig(Path(output_dir) /  f'confusion_matrix_{model_name}.png', dpi=250)
     
-
-
-
-def visualize_tsne(cfg, model):
+def visualize_tsne(cfg, model, datasets='coco'):
     # build dataloader(has annotation)
     mapper = VisualizeMapper(cfg, is_train=False)
     data_loader = build_detection_test_loader(cfg, cfg.DATASETS.TEST[0], mapper=mapper)
@@ -282,12 +280,27 @@ def visualize_tsne(cfg, model):
     embeded_features = []
     embeded_features_classes = []
     model.eval()
+    output_dir = f'./visualize_tsne'
+    os.makedirs(output_dir, exist_ok=True)
+    model_name =  cfg.MODEL.WEIGHTS
+    model_name = model_name.split('/')[-1]
+
+    global coco_names, voc_names
+
+    if datasets == 'coco':
+        names = coco_names
+        num_classes = len(coco_names)
+    elif datasets == 'voc':
+        names = voc_names
+        num_classes = len(voc_names)
+    else:
+        raise NotImplementedError
+
     for idx, inputs in enumerate(data_loader):
         if idx % 10 == 0:
             print('idx: ', idx)
         # from rcnn.py
-        images = preprocess_image(model.backbone.size_divisibility, model.pixel_mean, model.pixel_std, inputs)
-
+        images = model.preprocess_image(inputs)
         if "instances" in inputs[0]:
             gt_instances = [x["instances"].to('cuda') for x in inputs]
         else:
@@ -296,27 +309,75 @@ def visualize_tsne(cfg, model):
             features = model.backbone(images.tensor)
         except:
             features = model.backbone_q(images.tensor)
-
-        proposals, _ = model.proposal_generator(images, features)
-        del images
-
         features = [features['p2'], features['p3'], features['p4'], features['p5']]
-        
-        box_features = model.roi_heads.box_pooler(features, [x.proposal_boxes for x in proposals])
-        
+        # extract embeded feature with gt boxes
+        box_features = model.roi_heads.box_pooler(features, [x.gt_boxes for x in gt_instances])
         try:
             box_features = model.roi_heads.box_head(box_features)
         except:
             box_features = model.roi_heads.box_head_q(box_features)
-        del features
+        gt_classes = gt_instances[0].gt_classes
 
-        foreground_box_features, foreground_box_classes = label_and_proposals(proposals, gt_instances, box_features, model.roi_heads)
-        del box_features
- 
-        embeded_features.extend(foreground_box_features.detach().cpu().numpy())
-        embeded_features_classes.extend(foreground_box_classes.detach().cpu().numpy())
+        embeded_features.append(box_features.detach().cpu())
+        embeded_features_classes.append(gt_classes.detach().cpu())
         
-    return np.array(embeded_features), np.array(embeded_features_classes)    
+  
+    embeded_features = torch.cat(embeded_features) # num, feature_dim
+    embeded_features_classes = torch.cat(embeded_features_classes) # num
+    
+    # Select 100 instance for each classes
+    x = []
+    y = []
+    for i in range(num_classes):
+        temp_embeded_features = embeded_features[embeded_features_classes == i]
+        temp_embeded_features_classes = embeded_features_classes[embeded_features_classes == i]
+        temp_len = temp_embeded_features.shape[0]
+
+        if temp_len > 100:
+            select = np.random.choice(temp_len, 100, replace=False)
+            x.append(temp_embeded_features[select])
+            y.append(temp_embeded_features_classes[select])
+        else:
+            x.append(temp_embeded_features)
+            y.append(temp_embeded_features_classes)
+    features = torch.cat(x, dim=0)
+    labels = torch.cat(y, dim=0)
+    
+    n_components = 2
+    perplexities=list(range(10,15,10))
+    #perplexities=list(range(10,150,10))
+    
+    #palette = sn.color_palette(None, num_classes)
+    color_m = []
+    for i in range(num_classes):
+        if (i < 20) or (i >= 40 and i < 60): 
+            color_m.append(plt.cm.tab20b(i%20))
+        else:
+            color_m.append(plt.cm.tab20c(i%20))
+
+
+
+    # Y = torch.randn((80,2))
+    # labels = torch.arange(80)
+
+    for i, perplexity in enumerate(perplexities):
+        _, ax = plt.subplots()
+        tsne = TSNE(n_components=n_components, init='pca',
+                    random_state=0, perplexity=perplexity)
+        Y = tsne.fit_transform(features)
+        
+        sn.scatterplot(x=Y[:,0], y=Y[:,1], hue=labels, ax=ax, legend='full', palette=color_m)
+
+        ax.xaxis.set_major_formatter(NullFormatter())
+        ax.yaxis.set_major_formatter(NullFormatter())
+        ax.axis('tight')
+
+        plt.legend(loc='upper left', bbox_to_anchor=(1.0, 1.0), fontsize='xx-small', labels=names)
+
+        plt.savefig(Path(output_dir) / f'tsne_{model_name}_{perplexity}.png', dpi=300)
+        plt.pause(0.0001)
+        plt.clf()
+
 
 def visualize_proposals(cfg, model):
     # build dataloader(has annotation)
@@ -544,19 +605,19 @@ def main(args):
         DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
             cfg.MODEL.WEIGHTS, resume=args.resume
         )
-
+    test_model = model_teacher
     if cfg.VISUALIZATION.TYPE == "rpn":
-        visualize_proposals(cfg, model)
+        visualize_proposals(cfg, test_model)
     elif cfg.VISUALIZATION.TYPE == "roi":
-        visualize_predictions(cfg, model)
+        visualize_predictions(cfg, test_model)
     elif cfg.VISUALIZATION.TYPE == "tsne":
-        visualize_tsne(cfg, model)
+        visualize_tsne(cfg, test_model)
     elif cfg.VISUALIZATION.TYPE == "conf_mat":
-        visualize_confusion_mat(cfg, model, 'coco', )
+        visualize_confusion_mat(cfg, test_model, 'coco', )
     elif cfg.VISUALIZATION.TYPE == "cosine_sim":
-        visualize_cosine_sim(cfg, model)
+        visualize_cosine_sim(cfg, test_model)
     elif cfg.VISUALIZATION.TYPE == "umap":
-        visualize_umap(cfg, model)
+        visualize_umap(cfg, test_model)
     else:
         raise NotImplementedError
     

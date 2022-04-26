@@ -15,6 +15,7 @@ from detectron2.modeling.roi_heads.fast_rcnn import (
 )
 
 from detectron2.utils.events import EventStorage
+from detectron2.utils.events import get_event_storage
 
 
 ##########################
@@ -28,6 +29,7 @@ class MoCoOutputLayers(FastRCNNOutputLayers):
         self.class_score_weight = cfg.MOCO.CLASS_SCORE_WEIGHT # "none", "proposal", "queue", "both"
         self.cls_loss_type = cls_loss_type 
         self.num_classes = cfg.MODEL.ROI_HEADS.NUM_CLASSES
+        self.classwise_queue_warmup_iter = cfg.MOCO.CLASSWISE_QUEUE_WARMUP 
 
     def losses(self, predictions, proposals):
         """
@@ -65,7 +67,7 @@ class MoCoOutputLayers(FastRCNNOutputLayers):
                     proposal_boxes, gt_boxes, proposal_deltas, gt_classes
                 ),
             }
-            return {k: v * self.loss_weight.get(k, 1.0) for k, v in losses.items()}
+            return losses
 
         elif self.cls_loss_type == "FocalLoss":
 
@@ -84,13 +86,21 @@ class MoCoOutputLayers(FastRCNNOutputLayers):
         else:
             raise NotImplementedError
 
-    def contrastive_loss(self, projection_features, projection_labels, queue_features, queue_labels, temperature, branch):
+    def contrastive_loss(self, projection_features, projection_labels, queue_features, queue_labels, temperature, branch, queue_scores=None):
+        # if queue_features.dim() == 3:
+        #     queue = queue_features.view(-1)
+        #     queue_labels = torch.arange(queue_features.shape[0]).view(-1,1).expand(-1,queue_features.shape[1]).reshape(-1)
+
         if self.contrastive_loss_version == 'v1':
             return self.moco_contrastive_loss_v1(projection_features, projection_labels, queue_features, queue_labels, temperature, branch)
         elif self.contrastive_loss_version == 'v2':
             return self.moco_contrastive_loss_v2(projection_features, projection_labels, queue_features, queue_labels, temperature, branch)
         elif self.contrastive_loss_version == 'v2_2':
             return self.moco_contrastive_loss_v2_2(projection_features, projection_labels, queue_features, queue_labels, temperature, branch)
+        elif self. contrastive_loss_version == 'l2_loss':
+            return self.feature_l2_loss(projection_features, projection_labels, queue_features, queue_labels, branch)
+        else:
+            raise NotImplementedError    
     # 같은 class object끼리도 negative pair로 사용됨 
     def moco_contrastive_loss_v1(self, projection_features, proposals, queue_features, queue_labels, temperature, branch):
         '''
@@ -234,7 +244,7 @@ class MoCoOutputLayers(FastRCNNOutputLayers):
         return loss.sum() / num_proposals
 
     # 같은 class object에 대해서 negative pair로 사용하지 않음
-    # normalization 다르게 
+    # normalization v2와 다르게 
     # FSCE에서 분모에서 자기 자신만 뺌
     def moco_contrastive_loss_v2_2(self, projection_features, proposals, queue_features, queue_labels, temperature, branch):
         '''
@@ -246,7 +256,6 @@ class MoCoOutputLayers(FastRCNNOutputLayers):
         foreground: gt_label과 0.8이상 맞춰져야 contrastive loss
         background: gt_label과 0.4이하로 맞춰지면 backgroun로 
         '''
-
         if torch.any(queue_labels == -1):
             return 0
         
@@ -281,6 +290,8 @@ class MoCoOutputLayers(FastRCNNOutputLayers):
             return 0
 
         moco_logits = torch.mm(projection_features[keep], queue_features.cuda().T.clone().detach()) # [number of features, number of queue instances]
+        # what is temperature?? smaller temperature? larger temperature 
+        # 0.07 0.1 (smaller temperature make more peaky)
         moco_logits /= temperature
 
         logits_row_max, _ = torch.max(moco_logits, dim=1, keepdim=True)
@@ -307,6 +318,51 @@ class MoCoOutputLayers(FastRCNNOutputLayers):
         else:
             raise NotImplementedError 
         
+        return loss.mean()
+
+    def feature_l2_loss(self, prediction_features, proposals, queue_features, queue_labels, branch):
+        storage = get_event_storage()
+        if (torch.any(queue_labels == -1)) and (storage.iter < self.classwise_queue_warmup_iter):
+            return 0
+        # remove -1 class 
+        select = (queue_labels != -1)
+        queue_features = queue_features[select]
+        queue_labels = queue_labels[select]
+
+        gt_classes = torch.cat([p.gt_classes for p in proposals], dim=0) if len(proposals) else torch.empty(0)
+        iou = torch.cat([p.iou for p in proposals], dim=0) if len(proposals) else torch.empty(0)
+
+        # gt_bbox와 proposalbox가 0.7이상 겹칠때 contrastive learning에 사용.
+        if branch == "contrastive_label":
+            select = (iou > 0.7)
+        elif branch == "contrastive_unlabel":
+            select = (iou > 0.8)
+        else:
+            raise NotImplementedError
+        num_proposals = gt_classes.shape[0]
+
+        # remove low iou proposal
+        gt_classes = gt_classes[select]
+        iou = iou[select]
+        prediction_features = prediction_features[select]
+
+        if select.sum() == 0:
+            return 0
+
+        match_mask = torch.eq(gt_classes.view(-1,1), queue_labels.view(1,-1).cuda()) # [number of features, number of queue instances]
+        num_matched = match_mask.sum(dim=1)
+
+        # remove unmatched proposal
+        keep = num_matched != 0
+        match_mask = match_mask[keep]
+
+        if keep.sum() == 0:
+            return 0
+
+        cos_sim = torch.mm(prediction_features[keep], queue_features.cuda().T.clone().detach()) # [number of features, number of queue instances]
+        
+        loss = -2 * (cos_sim * match_mask).sum(dim=1) / (match_mask.sum(dim=1) + 1e-6)
+
         return loss.mean()
 
 # Follow the Bounding Box Regression with Uncertainty for Accurate Object Detection

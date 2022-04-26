@@ -108,7 +108,7 @@ def build_detection_semisup_train_loader(cfg, mapper=None):
     return build_batch_data_loader(
         dataset,
         sampler,
-        cfg.SOLVER.IMS_PER_BATCH,
+        cfg.SOLVER.IMS_PER_BATCH_LABEL + cfg.SOLVER.IMS_PER_BATCH_UNLABEL,
         aspect_ratio_grouping=cfg.DATALOADER.ASPECT_RATIO_GROUPING,
         num_workers=cfg.DATALOADER.NUM_WORKERS,
     )

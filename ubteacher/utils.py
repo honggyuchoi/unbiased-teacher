@@ -1,103 +1,302 @@
-def generate_projected_box_features(model, boxes, features):
-    """
-        features: List(dim 0: image index)
-        boxes: List(dim 0: image index)
-    """
-    box_features = model.roi_heads.box_pooler(features, boxes)
-    box_features = model.roi_heads.box_head(features)
-    box_projected_features = model.roi_heads.box_projector(features)
-
-    return box_projected_features
+import torch
 
 
+class FeatureQueue:
+    def __init__(self, cfg):
+        self.queue_size = cfg.MOCO.QUEUE_SIZE
+        self.feature_dim = cfg.MOCO.CONTRASTIVE_FEATURE_DIM
+        self.labeled_contrastive_iou_thres = cfg.MOCO.LABELED_CONTRASTIVE_IOU_THRES
+        self.unlabeled_contrastive_iou_thres = cfg.MOCO.UNLABELED_CONTRASTIVE_IOU_THRES
+       
+        self.queue = torch.randn(self.queue_size, self.feature_dim).detach()
+        self.queue_label = torch.empty(self.queue_size).fill_(-1).long().detach()
+        self.queue_ptr = torch.zeros(1, dtype=torch.long).detach()
+        self.cycles = torch.zeros(1).detach()
 
-@torch.no_grad()
-def label_and_sample_proposals(
-    self, proposals: List[Instances], targets: List[Instances]
-) -> List[Instances]:
-    """
-    Prepare some proposals to be used to train the ROI heads.
-    It performs box matching between `proposals` and `targets`, and assigns
-    training labels to the proposals.
-    It returns ``self.batch_size_per_image`` random samples from proposals and groundtruth
-    boxes, with a fraction of positives that is no larger than
-    ``self.positive_fraction``.
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, key, proposals, iou_threshold, background=False):
+        label = torch.cat([p.gt_classes for p in proposals], dim=0)
+        iou = torch.cat([p.iou for p in proposals], dim=0)
+    
+        if background == True:
+            select_foreground = torch.nonzero((iou > iou_threshold)).view(-1)
+            num_foreground = select_foreground.shape[0]
 
-    Args:
-        See :meth:`ROIHeads.forward`
+            select_background = torch.nonzero(((0.3 < iou) & (iou < 0.4))).view(-1)
+            num_background = select_background.shape[0]
 
-    Returns:
-        list[Instances]:
-            length `N` list of `Instances`s containing the proposals
-            sampled for training. Each `Instances` has the following fields:
+            if num_foreground < num_background:
+                indices = torch.randperm(num_background)[:num_foreground] # without replacement
+                select_background = select_background[indices]
+                num_background = select_background.shape[0]
 
-            - proposal_boxes: the proposal boxes
-            - gt_boxes: the ground-truth box that the proposal is assigned to
-                (this is only meaningful if the proposal has a label > 0; if label = 0
-                then the ground-truth box is random)
-
-            Other fields such as "gt_classes", "gt_masks", that's included in `targets`.
-    """
-    # Augment proposals with ground-truth boxes.
-    # In the case of learned proposals (e.g., RPN), when training starts
-    # the proposals will be low quality due to random initialization.
-    # It's possible that none of these initial
-    # proposals have high enough overlap with the gt objects to be used
-    # as positive examples for the second stage components (box head,
-    # cls head, mask head). Adding the gt boxes to the set of proposals
-    # ensures that the second stage components will have some positive
-    # examples from the start of training. For RPN, this augmentation improves
-    # convergence and empirically improves box AP on COCO by about 0.5
-    # points (under one tested configuration).
-    if self.proposal_append_gt:
-        proposals = add_ground_truth_to_proposals(targets, proposals)
-
-    proposals_with_gt = []
-
-    num_fg_samples = []
-    num_bg_samples = []
-    for proposals_per_image, targets_per_image in zip(proposals, targets):
-        has_gt = len(targets_per_image) > 0
-        match_quality_matrix = pairwise_iou(
-            targets_per_image.gt_boxes, proposals_per_image.proposal_boxes
-        )
-        # iou값 저장하자
-        matched_vals, _ = match_quality_matrix.max(dim=0) # max iou, _
+            num_select = num_foreground + num_background
+            select = torch.cat([select_foreground, select_background], dim = 0) 
+            
+        else:
+            select = torch.nonzero((iou > iou_threshold)).view(-1)
+            num_select = select.shape[0]# select iou over 0.8 (No background)
         
-        matched_idxs, matched_labels = self.proposal_matcher(match_quality_matrix) # matching된 gt idx와 foreground/background
-        sampled_idxs, gt_classes = self._sample_proposals(
-            matched_idxs, matched_labels, targets_per_image.gt_classes
-        )
+        if num_select == 0:
+            return 0
 
-        # Set target attributes of the sampled proposals:
-        proposals_per_image = proposals_per_image[sampled_idxs]
-        proposals_per_image.gt_classes = gt_classes # matching된 gt class(background면 self.num_class)
-        # IoU 값 저장 
-        if not proposals_per_image.has('iou'):
-            proposals_per_image.set('iou', matched_vals[sampled_idxs])
+        print(f'selected projected feature: {num_select}')
+        keys = key[select]
+        labels = label[select]
+        ious = iou[select]
 
-        if has_gt:
-            sampled_targets = matched_idxs[sampled_idxs]
-            # We index all the attributes of targets that start with "gt_"
-            # and have not been added to proposals yet (="gt_classes").
-            # NOTE: here the indexing waste some compute, because heads
-            # like masks, keypoints, etc, will filter the proposals again,
-            # (by foreground/background, or number of keypoints in the image, etc)
-            # so we essentially index the data twice.
-            for (trg_name, trg_value) in targets_per_image.get_fields().items():
-                if trg_name.startswith("gt_") and not proposals_per_image.has(trg_name):
-                    proposals_per_image.set(trg_name, trg_value[sampled_targets])
-        # If no GT is given in the image, we don't know what a dummy gt value can be.
-        # Therefore the returned proposals won't have any gt_* fields, except for a
-        # gt_classes full of background label.
+        batch_size = keys.shape[0]
+        if batch_size == 0:
+            return 0
+        
+        ptr = int(self.queue_ptr)
+        cycles = int(self.cycles)
+        if ptr + batch_size <= self.queue.shape[0]:
+            self.queue[ptr:ptr + batch_size, :] = keys
+            self.queue_label[ptr:ptr + batch_size] = labels
+        else:
+            rem = self.queue.shape[0] - ptr
+            self.queue[ptr:ptr + rem, :] = keys[:rem, :]
+            self.queue_label[ptr:ptr + rem] = labels[:rem]
 
-        num_bg_samples.append((gt_classes == self.num_classes).sum().item())
-        num_fg_samples.append(gt_classes.numel() - num_bg_samples[-1])
-        proposals_with_gt.append(proposals_per_image)
+        ptr += batch_size
+        if ptr >= self.queue.shape[0]:
+            ptr = 0
+            cycles += 1
+        self.cycles[0] = cycles
+        self.queue_ptr[0] = ptr
+        return cycles
+    
+    @torch.no_grad()
+    def _dequeue_and_enqueue_label(self, key, proposals, background=False):
+        label = torch.cat([p.gt_classes for p in proposals], dim=0)
+        iou = torch.cat([p.iou for p in proposals], dim=0)
+    
+        if background == True:
+            select_foreground = torch.nonzero((iou > self.labeled_contrastive_iou_thres)).view(-1)
+            num_foreground = select_foreground.shape[0]
 
-    # Log the number of fg/bg samples that are selected for training ROI heads
-    storage = get_event_storage()
-    storage.put_scalar("roi_head/num_fg_samples", np.mean(num_fg_samples))
-    storage.put_scalar("roi_head/num_bg_samples", np.mean(num_bg_samples))
+            select_background = torch.nonzero(((0.3 < iou) & (iou < 0.4))).view(-1)
+            num_background = select_background.shape[0]
 
-    return proposals_with_gt
+            if num_foreground < num_background:
+                indices = torch.randperm(num_background)[:num_foreground] # without replacement
+                select_background = select_background[indices]
+                num_background = select_background.shape[0]
+
+            num_select = num_foreground + num_background
+            select = torch.cat([select_foreground, select_background], dim = 0) 
+            
+        else:
+            select = torch.nonzero((iou > self.labeled_contrastive_iou_thres)).view(-1)
+            num_select = select.shape[0]# select iou over 0.8 (No background)
+
+        print(f'selected projected feature(label data): {num_select}')
+        keys = key[select]
+        labels = label[select]
+        ious = iou[select]
+
+        batch_size = keys.shape[0]
+        if batch_size == 0:
+            return 0
+        
+        ptr = int(self.queue_ptr)
+        cycles = int(self.cycles)
+        if ptr + batch_size <= self.queue.shape[0]:
+            self.queue[ptr:ptr + batch_size, :] = keys
+            self.queue_label[ptr:ptr + batch_size] = labels
+        else:
+            rem = self.queue.shape[0] - ptr
+            self.queue[ptr:ptr + rem, :] = keys[:rem, :]
+            self.queue_label[ptr:ptr + rem] = labels[:rem]
+
+        ptr += batch_size
+        if ptr >= self.queue.shape[0]:
+            ptr = 0
+            cycles += 1
+        self.cycles[0] = cycles
+        self.queue_ptr[0] = ptr
+        return cycles
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue_unlabel(self, key, classes):
+        label = torch.cat([c for c in classes], dim=0)
+
+        batch_size = keys.shape[0]
+        print(f'selected projected feature(unlabel data): {batch_size}')
+        if batch_size == 0:
+            return 0 
+
+        if self.queue_size % batch_size != 0:
+            print()
+            print('update by unlabeled_k')
+            print(self.queue_ptr, self.cycles, batch_size, self.queue.shape)
+            print()
+
+        ptr = int(self.queue_ptr)
+        cycles = int(self.cycles)
+        if ptr + batch_size <= self.queue.shape[0]:
+            self.queue[ptr:ptr + batch_size, :] = keys
+            self.queue_label[ptr:ptr + batch_size] = labels
+        else:
+            rem = self.queue.shape[0] - ptr
+            self.queue[ptr:ptr + rem, :] = keys[:rem, :]
+            self.queue_label[ptr:ptr + rem] = labels[:rem]
+
+        ptr += batch_size
+        if ptr >= self.queue.shape[0]:
+            ptr = 0
+            cycles += 1
+        self.cycles[0] = cycles
+        self.queue_ptr[0] = ptr
+        return cycles
+
+    def get_queue_info(self):
+        print(self.queue_ptr)
+        print(self.cycles)
+    
+        return self.queue_ptr, self.cycles
+    
+    @torch.no_grad()
+    def get_queue(self):
+        return self.queue
+    @torch.no_grad()
+    def get_queue_label(self):
+        return self.queue_label
+
+class ClasswiseFeatureQueue:
+    def __init__(self, cfg):
+        self.feature_dim = cfg.MOCO.CONTRASTIVE_FEATURE_DIM
+        self.labeled_contrastive_iou_thres = cfg.MOCO.LABELED_CONTRASTIVE_IOU_THRES
+        self.unlabeled_contrastive_iou_thres = cfg.MOCO.UNLABELED_CONTRASTIVE_IOU_THRES
+
+        self.num_classes = cfg.MODEL.ROI_HEADS.NUM_CLASSES
+        self.items_per_class = cfg.MOCO.CLASSWISE_QUEUE_ITEMS_PER_CLASS
+        
+        self.queue = torch.randn(self.num_classes, self.items_per_class, self.feature_dim).detach()
+        self.queue_ptr = torch.zeros(self.num_classes, dtype=torch.long).detach()
+        self.cycles = torch.zeros(self.num_classes, dtype=torch.long).detach()
+        self.queue_label = torch.empty((self.num_classes, self.items_per_class)).fill_(-1).long().detach()
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, key, proposals, iou_threshold, background=False):
+        label = torch.cat([p.gt_classes for p in proposals], dim=0)
+        iou = torch.cat([p.iou for p in proposals], dim=0)
+    
+        select = torch.nonzero((iou > iou_threshold)).view(-1)
+
+        print(f'selected projected feature(label data): {select.numel()}')
+
+        keys = key[select]
+        labels = label[select]
+        ious = iou[select]
+
+        for i in torch.unique(labels):
+            idx = (labels == i)
+            select_keys = keys[idx]
+            select_ious = ious[idx]
+
+            batch_size = select_keys.shape[0]
+            if batch_size == 0:
+                continue
+            ptr = int(self.queue_ptr[i])
+            cycles = int(self.cycles[i])
+
+            if ptr + batch_size <= self.queue[i].shape[0]:
+                self.queue[i, ptr:ptr + batch_size, :] = select_keys
+                self.queue_label[i, ptr:ptr + batch_size] = i
+            else:
+                rem = self.queue[i].shape[0] - ptr
+                self.queue[i, ptr:ptr + rem, :] = select_keys[:rem, :]
+                self.queue_label[i, ptr:ptr + rem] = i
+            
+            ptr += batch_size
+            if ptr >= self.queue[i].shape[0]:
+                ptr = 0
+                cycles += 1
+            self.queue_ptr[i] = ptr
+            self.cycles[i] = cycles
+
+        return 0
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue_label(self, key, proposals, background=False):
+        label = torch.cat([p.gt_classes for p in proposals], dim=0)
+        iou = torch.cat([p.iou for p in proposals], dim=0)
+    
+        select = torch.nonzero((iou > self.labeled_contrastive_iou_thres)).view(-1)
+
+        print(f'selected projected feature(label data): {select.numel()}')
+        keys = key[select]
+        labels = label[select]
+        ious = iou[select]
+
+        for i in torch.unique(labels):
+            idx = (labels == i)
+            select_keys = keys[idx]
+            select_ious = ious[idx]
+
+            batch_size = select_keys.shape[0]
+            if batch_size == 0:
+                continue
+            ptr = int(self.queue_ptr[i])
+            cycles = int(self.cycles[i])
+
+            if ptr + batch_size <= self.queue[i].shape[0]:
+                self.queue[i, ptr:ptr + batch_size, :] = select_keys
+                self.queue_label[i, ptr:ptr + batch_size] = i
+            else:
+                rem = self.queue[i].shape[0] - ptr
+                self.queue[i, ptr:ptr + rem, :] = select_keys[:rem, :]
+                self.queue_label[i, ptr:ptr + rem] = i
+            
+            ptr += batch_size
+            if ptr >= self.queue[i].shape[0]:
+                ptr = 0
+                cycles += 1
+            self.queue_ptr[i] = ptr
+            self.cycles[i] = cycles
+
+        return 0
+
+    @torch.no_grad()
+    def _dequeue_and_enqueue_unlabel(self, keys, classes):
+        labels = torch.cat([c for c in classes], dim=0)
+
+        for i in torch.unique(labels):
+            idx = (labels == i)
+            select_keys = keys[idx]
+            batch_size = select_keys.shape[0]
+
+            ptr = int(self.queue_ptr[i])
+            cycles = int(self.cycles[i])
+
+            if ptr + batch_size <= self.queue[i].shape[0]:
+                self.queue[i, ptr:ptr + batch_size, :] = select_keys
+                self.queue_label[i, ptr:ptr + batch_size] = i
+            else:
+                rem = self.queue[i].shape[0] - ptr
+                self.queue[i, ptr:ptr + rem, :] = select_keys[:rem, :]
+                self.queue_label[i, ptr:ptr + batch_size] = i
+
+            ptr += batch_size
+            if ptr >= self.queue[i].shape[0]:
+                ptr = 0
+                cycles += 1
+            self.cycles[i] = cycles
+            self.queue_ptr[i] = ptr
+        return 0
+    
+    def get_queue_info(self):
+        print(self.queue_ptr)
+        print(self.cycles)
+    
+        return self.queue_ptr, self.cycles
+    
+    @torch.no_grad()
+    def get_queue(self):
+        return self.queue.view(-1, self.queue.shape[-1])
+
+    @torch.no_grad()
+    def get_queue_label(self):
+        return self.queue_label.view(-1)

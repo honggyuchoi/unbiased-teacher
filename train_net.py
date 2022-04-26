@@ -14,6 +14,7 @@ from ubteacher.engine.trainer import (
 )
 from ubteacher.engine.mocov2trainer import MoCov2Trainer
 from ubteacher.engine.mocov1trainer import MoCov1Trainer
+from ubteacher.engine.mocov3trainer import MoCov3Trainer
 
 # hacky way to register
 from ubteacher.modeling.meta_arch.rcnn import TwoStagePseudoLabGeneralizedRCNN
@@ -48,13 +49,19 @@ def main(args):
     # teacher - student backbone to roi_heads 
     elif cfg.SEMISUPNET.Trainer == "mocov2":
         Trainer = MoCov2Trainer
+    elif cfg.SEMISUPNET.Trainer == "mocov1":
+        Trainer = MoCov1Trainer 
+    elif cfg.SEMISUPNET.Trainer == "mocov3":
+        Trainer = MoCov3Trainer
     else:
         raise ValueError("Trainer Name is not found.")
 
     if args.eval_only:
         if cfg.SEMISUPNET.Trainer == "ubteacher" \
-            or cfg.SEMISUPNET.Trainer == "mocov2":
-            
+            or cfg.SEMISUPNET.Trainer == "mocov2" \
+            or cfg.SEMISUPNET.Trainer == "mocov1" \
+            or cfg.SEMISUPNET.Trainer == "mocov3":
+
             model = Trainer.build_model(cfg)
             model_teacher = Trainer.build_model(cfg)
             ensem_ts_model = EnsembleTSModel(model_teacher, model)
@@ -63,6 +70,7 @@ def main(args):
                 ensem_ts_model, save_dir=cfg.OUTPUT_DIR
             ).resume_or_load(cfg.MODEL.WEIGHTS, resume=args.resume)
             res = Trainer.test(cfg, ensem_ts_model.modelTeacher)
+            #res = Trainer.test(cfg, ensem_ts_model.modelStudent)
 
         else:
             model = Trainer.build_model(cfg)
@@ -74,7 +82,6 @@ def main(args):
 
     trainer = Trainer(cfg)
     trainer.resume_or_load(resume=args.resume)
-
     return trainer.train()
 
 

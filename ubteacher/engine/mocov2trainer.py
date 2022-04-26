@@ -48,11 +48,6 @@ class MoCov2Trainer(DefaultTrainer):
             weak augmentation -> generate pseudo label 
             strong augmentation -> training
 
-        TODO:
-        1. unlabeled data(weak aug)로 pseudo label을 만들고
-        model을 labeled data(weak, strong) + unlabeled(strong) 으로 학습
-        2. contrastive loss는 어떻게 추가해야하지? 
-        
         Args:
             cfg (CfgNode):
         Use the custom checkpointer, which loads other backbone models
@@ -69,6 +64,10 @@ class MoCov2Trainer(DefaultTrainer):
         model_teacher = self.build_model(cfg)
         self.model_teacher = model_teacher
 
+
+        for param in self.model_teacher.parameters():
+            param.requires_grad = False
+        
         # For training, wrap with DDP. But don't need this for inference.
         if comm.get_world_size() > 1:
             model = DistributedDataParallel(
@@ -94,13 +93,19 @@ class MoCov2Trainer(DefaultTrainer):
         self.contrastive_feature_dim = cfg.MOCO.CONTRASTIVE_FEATURE_DIM
         self.temperature = cfg.MOCO.TEMPERATURE
         self.labeled_contrastive_iou_thres = cfg.MOCO.LABELED_CONTRASTIVE_IOU_THRES
+        self.unlabeled_contrastive_iou_thres = cfg.MOCO.UNLABELED_CONTRASTIVE_IOU_THRES
         self.debug_deque_and_enque = False 
         self.box_in_features = cfg.MODEL.ROI_HEADS.IN_FEATURES
         self.pseudo_label_jittering = cfg.MOCO.PSEUDO_LABEL_JITTERING
         self.classwise_queue = cfg.MOCO.CLASSWISE_QUEUE
         self.queue_update_label_with_background = cfg.MOCO.QUEUE_UPDATE_LABEL_WITH_BACKGROUND
         
-        self.ensem_ts_model._init_queue(self.queue_size, self.contrastive_feature_dim, self.classwise_queue)
+        self.enabled_unlabeled_contrastive_loss = cfg.MOCO.ENABLED_UNLABELED_CONTRASTIVE_LOSS 
+        self.enabled_unlabeled_queue_update = cfg.MOCO.ENABLED_UNLABELED_QUEUE_UPDATE
+
+        self.insert_noise_to_features = cfg.MOCO.INSERT_NOISE_TO_FEATURES
+        
+        self.ensem_ts_model._init_queue(self.cfg, self.classwise_queue)
 
         self.checkpointer = DetectionTSCheckpointer(
             self.ensem_ts_model,
@@ -110,6 +115,8 @@ class MoCov2Trainer(DefaultTrainer):
         )
 
         self.register_hooks(self.build_hooks())
+
+        self.warmup_ema = cfg.MOCO.WARMUP_EMA # If true, EMA parameter 0.5 -> 0.9996
 
 
     def resume_or_load(self, resume=True):
@@ -124,6 +131,7 @@ class MoCov2Trainer(DefaultTrainer):
         Args:
             resume (bool): whether to do resume or not
         """
+        
         checkpoint = self.checkpointer.resume_or_load(
             self.cfg.MODEL.WEIGHTS, resume=resume
         )
@@ -131,6 +139,11 @@ class MoCov2Trainer(DefaultTrainer):
             self.start_iter = checkpoint.get("iteration", -1) + 1
             # The checkpoint stores the training iteration that just finished, thus we start
             # at the next iteration (or iter zero if there's no checkpoint).
+        if self.cfg.MODEL.WEIGHTS and self.cfg.MOCO.RESUME_AFTER_BURNUP:
+            self.start_iter = checkpoint['scheduler'].get('last_epoch', -1) + 1
+            checkpoint = self.checkpointer._load_optimizer_scheduler(checkpoint)
+            self.ensem_ts_model._init_queue(self.queue_size, self.contrastive_feature_dim, self.classwise_queue)
+
         if isinstance(self.model, DistributedDataParallel):
             # broadcast loaded data/model from the first rank, because other
             # machines may not have access to the checkpoint file
@@ -145,7 +158,7 @@ class MoCov2Trainer(DefaultTrainer):
         evaluator_list = []
         evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
         
-        if cfg.TEST.EVALUATOR == "coco":
+        if cfg.TEST.EVALUATOR == "coco" or cfg.TEST.EVALUATOR == "cocoEVAL":
             evaluator_list.append(COCOEvaluator(
                 dataset_name, output_dir=output_folder))
             return evaluator_list[0]
@@ -197,6 +210,9 @@ class MoCov2Trainer(DefaultTrainer):
                 for self.iter in range(start_iter, max_iter):
                     self.before_step()
                     self.run_step_full_semisup()
+                    # save model end of burnup stage
+                    if self.iter + 1 == self.cfg.SEMISUPNET.BURN_UP_STEP:
+                        self.checkpointer.save('model_burnup')
                     self.after_step()
             except Exception:
                 logger.exception("Exception during training:")
@@ -323,11 +339,12 @@ class MoCov2Trainer(DefaultTrainer):
                 # update copy the the whole model
                 self._update_teacher_model(keep_rate=0.00)
             # update
-            elif (
-                self.iter - self.cfg.SEMISUPNET.BURN_UP_STEP
-            ) % self.cfg.SEMISUPNET.TEACHER_UPDATE_ITER == 0:
-                self._update_teacher_model(
-                    keep_rate=self.cfg.SEMISUPNET.EMA_KEEP_RATE)# hyperparameter.. should be tuned
+            elif (self.iter - self.cfg.SEMISUPNET.BURN_UP_STEP) % self.cfg.SEMISUPNET.TEACHER_UPDATE_ITER == 0:
+                if self.warmup_ema:
+                    alpha = self.cfg.SEMISUPNET.EMA_KEEP_RATE # 0.9996
+                    global_step = self.iter - self.cfg.SEMISUPNET.BURN_UP_STEP
+                    alpha = min(1 - 1 / (global_step + 1), alpha) 
+                self._update_teacher_model(keep_rate=alpha)# hyperparameter.. should be tuned
 
             record_dict = {}
             #  generate the pseudo-label using teacher model
@@ -350,6 +367,7 @@ class MoCov2Trainer(DefaultTrainer):
             # class imbalance를 해결하기 위해서는 class별로 queue를 유지하는게 어떨까?? -> 일단은 하나의 queue유지 
             with torch.no_grad():
                 data_k = unlabel_data_k + label_data_k
+                # shuffle bn's problem??(issued in moco)
                 unlabel_data_k_batch_size = len(unlabel_data_k)
                 (
                     _,
@@ -387,6 +405,13 @@ class MoCov2Trainer(DefaultTrainer):
                 )
                 joint_proposal_dict["proposals_pseudo_roih"] = pseudo_proposals_roih_unsup_k
 
+                # count pseudo label
+                num_pseudo_label = 0
+                for pseudo_label in pseudo_proposals_roih_unsup_k:
+                    num_pseudo_label += pseudo_label.gt_classes.shape[0]
+                num_pseudo_label /= len(pseudo_proposals_roih_unsup_k)
+                self.storage.put_scalar("num_pseudo_label", num_pseudo_label)
+
                 #  add pseudo-label to unlabeled data
                 unlabel_data_q = self.add_label(
                     unlabel_data_q, joint_proposal_dict["proposals_pseudo_roih"]
@@ -395,36 +420,58 @@ class MoCov2Trainer(DefaultTrainer):
                     unlabel_data_k, joint_proposal_dict["proposals_pseudo_roih"]
                 )
                 ############# contrastive target 만들기 #########################
-                self.contrastive_queue_update_v1(label_data_k, proposals_rpn_sup_k, features_label_k, joint_proposal_dict, features_unlabel_k)
+                self.contrastive_queue_update_v1(
+                    label_data_k=label_data_k, # gt
+                    proposals_rpn_sup_k=proposals_rpn_sup_k, # proposal 
+                    features_label_k=features_label_k, # features
+                    joint_proposal_dict=joint_proposal_dict,  # pseudo label
+                    features_unlabel_k=features_unlabel_k # features
+                )
 
             #################################################################
             # labeled image에 weak와 strong aug가 적용된 이미지들을 이용해서 student 학습
             all_label_data = label_data_q + label_data_k 
             # unlabeled image에 weak aug을 적용하여 pseudo label을 만들고 strong aug가 적용된 이미지들을 이용해서 student 학습
-            all_unlabel_data = unlabel_data_q 
+            # weak aug를 쓰지 않는 이유는 pseudo label에서 weak aug를 사용하지 않는 이유는 
+            # pseudo label과 proposal 사이의 gap이 줄어들수있고 심지어 student가 더 좋은 bounding box를 생성할수도 있기 때문
+            # contrastive loss를 적용할때는 상관없을듯?
+            all_unlabel_data = unlabel_data_q
 
          
-
+            # queue에 label_data_k에서 teacher모델을 통해 만들어낸 projected feature가 존재하는데
+            # 동일한 image에 대해서 student모델을 통해 만들어낸 projected feature와 contrastive loss를 만든다.. 
+            # feature단에 dropout이나 dropblock을 적용해야하지않을까??
+            # TODO:strong_aug가 적용된 이미지에도 feature noise를 넣어주어도 될까?
             record_all_label_data, _, _, _ = self.model(
                 all_label_data, 
                 branch="contrastive_label", 
-                queue=self.ensem_ts_model.queue, 
-                queue_label=self.ensem_ts_model.queue_label,
-                temperature=self.temperature
+                queue=self.ensem_ts_model.feat_queue.queue, 
+                queue_label=self.ensem_ts_model.feat_queue.queue_label,
+                temperature=self.temperature,
+                noise=self.insert_noise_to_features
             )
             record_dict.update(record_all_label_data)
-            record_all_unlabel_data, _, _, _ = self.model(
-                all_unlabel_data, 
-                branch="contrastive_unlabel",
-                queue=self.ensem_ts_model.queue,
-                queue_label=self.ensem_ts_model.queue_label,
-                temperature=self.temperature
+            
+            if self.enabled_unlabeled_contrastive_loss == True:
+                # general loss(cls loss, reg loss) -> unlabel_data_q
+                # contrastive loss -> unlabel_data_q, unlabel_data_k
+                record_all_unlabel_data, _, _, _ = self.model(
+                    all_unlabel_data + unlabel_data_k, 
+                    branch="contrastive_unlabel",
+                    queue=self.ensem_ts_model.feat_queue.queue,
+                    queue_label=self.ensem_ts_model.feat_queue.queue_label,
+                    temperature=self.temperature,
+                    noise=self.insert_noise_to_features,
+                    split=len(all_unlabel_data)
+                )
+            else:
+                record_all_unlabel_data, _, _, _ = self.model(
+                all_unlabel_data, branch="supervised"
             )
+            
             new_record_all_unlabel_data = {}
             for key in record_all_unlabel_data.keys():
-                new_record_all_unlabel_data[key + "_pseudo"] = record_all_unlabel_data[
-                    key
-                ]
+                new_record_all_unlabel_data[key + "_pseudo"] = record_all_unlabel_data[key]
             record_dict.update(new_record_all_unlabel_data)
 
             # weight losses
@@ -648,18 +695,33 @@ class MoCov2Trainer(DefaultTrainer):
 
     # roi로 들어온 proposal중에 gt와의 iou에 따라 foreground sample과 background를 저장 
     # background sample이 있는게 더 좋은 성능이 나옴
-    # 애초에 roi로 넘어오는 sample은 0.7이상이거나 0.3이하임
+    # 0.1 < <0.3 만 queue에 넣어도 background가 굉장히 많음// 
+    # 0.3 < <0.4 로 hard negaitve만들고 foreground sample이랑 같은 갯수로 sampling 하는것??
     @torch.no_grad()
     def _dequeue_and_enqueue_label(self, key, proposals, background=False):
         label = torch.cat([p.gt_classes for p in proposals], dim=0)
         iou = torch.cat([p.iou for p in proposals], dim=0)
-
+    
         if background == True:
-            select = ((iou > self.labeled_contrastive_iou_thres) | (iou < 0.3))# select iou over 0.8 (background also need)
-        else:
-            select = (iou > self.labeled_contrastive_iou_thres)# select iou over 0.8 (No background)
+            select_foreground = torch.nonzero((iou > self.labeled_contrastive_iou_thres)).view(-1)
+            num_foreground = select_foreground.shape[0]
 
-        print(f'selected projected feature(label data): {select.sum()}')
+            select_background = torch.nonzero(((0.3 < iou) & (iou < 0.4))).view(-1)
+            num_background = select_background.shape[0]
+
+            if num_foreground < num_background:
+                indices = torch.randperm(num_background)[:num_foreground] # without replacement
+                select_background = select_background[indices]
+                num_background = select_background.shape[0]
+
+            num_select = num_foreground + num_background
+            select = torch.cat([select_foreground, select_background], dim = 0) 
+            
+        else:
+            select = torch.nonzero((iou > self.labeled_contrastive_iou_thres)).view(-1)
+            num_select = select.shape[0]# select iou over 0.8 (No background)
+
+        print(f'selected projected feature(label data): {num_select}')
         if self.debug_deque_and_enque:
             keys = key[select]
             labels = label[select]
@@ -804,25 +866,26 @@ class MoCov2Trainer(DefaultTrainer):
         boxes_per_image = [x.proposal_boxes for x in proposals_rpn_sup_k]
         projected_features = self.generate_projected_box_features(self.model_teacher, boxes_per_image, features_label_k)
         # label_data_k를 이용해서 queue update
-        _ = self._dequeue_and_enqueue_label(projected_features, proposals_rpn_sup_k, self.queue_update_label_with_background)
+        _ = self.ensem_ts_model.feat_queue._dequeue_and_enqueue_label(projected_features, proposals_rpn_sup_k, self.queue_update_label_with_background)
         del projected_features, boxes_per_image, proposals_rpn_sup_k, label_data_k_targets
 
         # 2. Unlabeled data 
         # 이웃 feature에서도 pooling해서 positive로 사용하면 좋을듯?  -> 어떻게 구현?? 
         # features_unsup_k: features
         # joint_proposal_dict["proposals_pseudo_roih"]: pseudo label
-        pseudo_boxes = [x.gt_boxes for x in joint_proposal_dict["proposals_pseudo_roih"]]
-        pseudo_classes = [x.gt_classes for x in joint_proposal_dict["proposals_pseudo_roih"]]
+        if self.enabled_unlabeled_queue_update is True:
+            pseudo_boxes = [x.gt_boxes for x in joint_proposal_dict["proposals_pseudo_roih"]]
+            pseudo_classes = [x.gt_classes for x in joint_proposal_dict["proposals_pseudo_roih"]]
 
-        # apply jittering
-        if self.pseudo_label_jittering: 
-            cont_pseudo_boxes, cont_pseudo_classes = self.box_jittering(pseudo_boxes, pseudo_classes, times=10, frac=0.06)
-        else:
-            cont_pseudo_boxes, cont_pseudo_classes = (pseudo_boxes, pseudo_classes)
-        
-        projected_features = self.generate_projected_box_features(self.model_teacher, cont_pseudo_boxes, features_unlabel_k)
+            # apply jittering
+            if self.pseudo_label_jittering: 
+                cont_pseudo_boxes, cont_pseudo_classes = self.box_jittering(pseudo_boxes, pseudo_classes, times=10, frac=0.06)
+            else:
+                cont_pseudo_boxes, cont_pseudo_classes = (pseudo_boxes, pseudo_classes)
+            
+            projected_features = self.generate_projected_box_features(self.model_teacher, cont_pseudo_boxes, features_unlabel_k)
 
-        _ = self._dequeue_and_enqueue_unlabel(projected_features, cont_pseudo_classes)
+            _ = self.ensem_ts_model.feat_queue._dequeue_and_enqueue_unlabel(projected_features, cont_pseudo_classes)
     
     # label과 pseudo label을 jittering을 적용하여 queue update
     # @torch.no_grad()
