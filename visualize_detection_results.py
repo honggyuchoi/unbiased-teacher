@@ -74,7 +74,77 @@ coco_names = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'trai
 voc_names =  ['aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus', 'car', 'cat', 'chair', 'cow', 'diningtable', 'dog',
         'horse', 'motorbike', 'person', 'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'] 
 
-def visualize_cosine_sim(cfg, model, datasets='coco'):
+def visualize_iou_uncertainty(cfg, model, datasets='coco'):
+    mapper = VisualizeMapper(cfg, is_train=False)
+    data_loader = build_detection_test_loader(cfg, cfg.DATASETS.TEST[0], mapper=mapper)
+    
+    model.eval()
+    output_dir = f'./visualize_correlation'
+    os.makedirs(output_dir, exist_ok=True)
+    model_name =  cfg.MODEL.WEIGHTS
+    model_name = model_name.split('/')[-2]
+
+    global coco_names, voc_names
+
+    if datasets == 'coco':
+        names = coco_names
+        num_classes = len(coco_names)
+    elif datasets == 'voc':
+        names = voc_names
+        num_classes = len(voc_names)
+    else:
+        raise NotImplementedError
+
+    uncertainty_x1_list = []
+    uncertainty_y1_list = []
+    uncertainty_x2_list = []
+    uncertainty_y2_list = []
+    uncertainty_mean_list = []
+    iou_list = []
+    for idx, inputs in enumerate(data_loader):
+        # import pdb
+        # pdb.set_trace()
+        if idx % 10 == 0:
+            print('idx: ', idx)
+        results = model(inputs)
+
+        if "instances" in inputs[0]:
+            gt_instances = [x["instances"].to('cuda') for x in inputs]
+
+        for predictions_per_image, targets_per_image in zip(results, gt_instances):
+            has_gt = len(targets_per_image) > 0
+            match_quality_matrix = pairwise_iou(targets_per_image.gt_boxes, predictions_per_image.pred_boxes)
+            
+            match_class = torch.eq(targets_per_image.gt_classes.view(-1,1), predictions_per_image.pred_classes.view(1.-1))
+
+            match_quality_matrix = match_quality_matrix * match_class 
+
+            if has_gt:
+                matched_vals, matched_idx = match_quality_matrix.max(dim=0)
+            else:
+                matched_vals = torch.zeros(match_quality_matrix.shape[1]).to(match_quality_matrix.device)
+
+            iou_list.append(matched_vals.view(-1))
+            uncertainty_list(predictions_per_image.uncertainties.view(-1))
+
+    iou_list = torch.cat(iou_list, dim=0)
+    uncertainty_x1_list = torch.cat(uncertainty_x1_list, dim=0)
+    uncertainty_y1_list = torch.cat(uncertainty_y1_list, dim=0)
+    uncertainty_x2_list = torch.cat(uncertainty_x2_list, dim=0)
+    uncertainty_y2_list = torch.cat(uncertainty_y2_list, dim=0)
+    uncertainty_mean_list = torch.cat(uncertainty_mean_list, dim=0)
+
+
+    
+    # x1, y1, x2, y2, mean
+    fig, axes = plt.subplot(3,2)
+    
+    axes[0,0].scatter
+
+    plot.scatter(data[idx,0], data[idx,1], s=10, alpha=0.6, color=plt.cm.tab20(i / 20))
+
+
+def visualize_cosine_sim(cfg, model, datasets='voc'):
     # build dataloader(has annotation)
     mapper = VisualizeMapper(cfg, is_train=False)
     data_loader = build_detection_test_loader(cfg, cfg.DATASETS.TEST[0], mapper=mapper)
@@ -86,7 +156,7 @@ def visualize_cosine_sim(cfg, model, datasets='coco'):
     output_dir = f'./visualize_cosine_mat'
     os.makedirs(output_dir, exist_ok=True)
     model_name =  cfg.MODEL.WEIGHTS
-    model_name = model_name.split('/')[-1]
+    model_name = model_name.split('/')[-2]
 
     global coco_names, voc_names
 
@@ -152,7 +222,7 @@ def visualize_cosine_sim(cfg, model, datasets='coco'):
     fig = plt.figure(figsize=(12, 9))
     sn.set(font_scale=1.0 if num_classes < 50 else 0.8)  # for label size
     labels = (0 < len(names) < 99) and len(names) == num_classes  # apply names to ticklabels
-    sn.heatmap(cosine_sim_mat, vmin=-1.0, vmax=1.0, annot=num_classes < 30, annot_kws={"size": 8}, cmap='Blues', fmt='.2f', square=True,
+    sn.heatmap(cosine_sim_mat, vmin=0.0, vmax=1.0, annot=num_classes < 30, annot_kws={"size": 8}, cmap='Blues', fmt='.2f', square=True,
                 xticklabels=names,
                 yticklabels=names).set_facecolor((1, 1, 1))
     fig.tight_layout()
@@ -545,18 +615,22 @@ def main(args):
             cfg.MODEL.WEIGHTS, resume=args.resume
         )
 
+    test_model = model_teacher
+    # test_model = model_teacher
     if cfg.VISUALIZATION.TYPE == "rpn":
-        visualize_proposals(cfg, model)
+        visualize_proposals(cfg, test_model)
     elif cfg.VISUALIZATION.TYPE == "roi":
-        visualize_predictions(cfg, model)
+        visualize_predictions(cfg, test_model)
     elif cfg.VISUALIZATION.TYPE == "tsne":
-        visualize_tsne(cfg, model)
+        visualize_tsne(cfg, test_model)
     elif cfg.VISUALIZATION.TYPE == "conf_mat":
-        visualize_confusion_mat(cfg, model, 'coco', )
+        visualize_confusion_mat(cfg, test_model, 'coco', )
     elif cfg.VISUALIZATION.TYPE == "cosine_sim":
-        visualize_cosine_sim(cfg, model)
+        visualize_cosine_sim(cfg, test_model)
     elif cfg.VISUALIZATION.TYPE == "umap":
-        visualize_umap(cfg, model)
+        visualize_umap(cfg, test_model)
+    elif cfg.VISUALIZATION.TYPE == "iou_uncertainty":
+        visualize_iou_uncertainty(cfg, test_model)
     else:
         raise NotImplementedError
     

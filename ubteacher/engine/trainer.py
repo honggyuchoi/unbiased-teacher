@@ -326,7 +326,10 @@ class UBTeacherTrainer(DefaultTrainer):
         self.max_iter = cfg.SOLVER.MAX_ITER
         self.cfg = cfg
 
-        self.register_hooks(self.build_hooks())
+        if cfg.SOLVER.MAX_ITER == cfg.SEMISUPNET.BURN_UP_STEP:
+            self.register_hooks(self.build_hooks_2())
+        else:
+            self.register_hooks(self.build_hooks())
 
     def resume_or_load(self, resume=True):
         """
@@ -361,7 +364,7 @@ class UBTeacherTrainer(DefaultTrainer):
         evaluator_list = []
         evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
         
-        if cfg.TEST.EVALUATOR == "coco":
+        if cfg.TEST.EVALUATOR == "coco" or cfg.TEST.EVALUATOR == 'cocoEVAL':
             evaluator_list.append(COCOEvaluator(
                 dataset_name, output_dir=output_folder))
             return evaluator_list[0]
@@ -505,6 +508,7 @@ class UBTeacherTrainer(DefaultTrainer):
         unlabel_data_q = self.remove_label(unlabel_data_q)
         unlabel_data_k = self.remove_label(unlabel_data_k)
 
+        uncertainty_info = {}
         # burn-in stage (supervised training with labeled data)
         if self.iter < self.cfg.SEMISUPNET.BURN_UP_STEP:
 
@@ -516,7 +520,9 @@ class UBTeacherTrainer(DefaultTrainer):
             # weight losses
             loss_dict = {}
             for key in record_dict.keys():
-                if key[:4] == "loss":
+                if key == "loss_box_reg_first_term" or key == "loss_box_reg_second_term":
+                        uncertainty_info[key] = record_dict[key]
+                elif key[:4] == "loss":
                     loss_dict[key] = record_dict[key] * 1
             losses = sum(loss_dict.values())
 
@@ -606,6 +612,8 @@ class UBTeacherTrainer(DefaultTrainer):
                             record_dict[key] *
                             self.cfg.SEMISUPNET.UNSUP_LOSS_WEIGHT
                         )
+                    elif key == "loss_box_reg_first_term" or key == "loss_box_reg_second_term":
+                        uncertainty_info[key] = record_dict[key]
                     else:  # supervised loss
                         loss_dict[key] = record_dict[key] * 1
 
@@ -613,6 +621,7 @@ class UBTeacherTrainer(DefaultTrainer):
 
         metrics_dict = record_dict
         metrics_dict["data_time"] = data_time
+        metrics_dict.update(uncertainty_info)
         self._write_metrics(metrics_dict)
 
         self.optimizer.zero_grad()
@@ -741,17 +750,89 @@ class UBTeacherTrainer(DefaultTrainer):
                    test_and_save_results_student))
         ret.append(hooks.EvalHook(cfg.TEST.EVAL_PERIOD,
                    test_and_save_results_teacher))
-
-        if comm.is_main_process():
-            # run writers in the end, so that evaluation metrics are written
-            ret.append(hooks.PeriodicWriter(self.build_writers(), period=20))
-            ret.append(
+        ret.append(
                 BestCheckpointer(
                     cfg.TEST.EVAL_PERIOD, 
                     self.checkpointer, 
                     'bbox/AP', 
                     'max', 
-                    'model_best'
+                    'Teachermodel_best'
                 )
             )
+        ret.append(
+                BestCheckpointer(
+                    cfg.TEST.EVAL_PERIOD, 
+                    self.checkpointer, 
+                    'bbox_student/AP', 
+                    'max', 
+                    'Studentmodel_best'
+                )
+            )
+
+        if comm.is_main_process():
+            # run writers in the end, so that evaluation metrics are written
+            ret.append(hooks.PeriodicWriter(self.build_writers(), period=20))
+            
+        return ret
+
+
+    def build_hooks_2(self):
+        cfg = self.cfg.clone()
+        cfg.defrost()
+        cfg.DATALOADER.NUM_WORKERS = 0  # save some memory and time for PreciseBN
+
+        ret = [
+            hooks.IterationTimer(),
+            hooks.LRScheduler(self.optimizer, self.scheduler),
+            hooks.PreciseBN(
+                # Run at the same freq as (but before) evaluation.
+                cfg.TEST.EVAL_PERIOD,
+                self.model,
+                # Build a new data loader to not affect training
+                self.build_train_loader(cfg),
+                cfg.TEST.PRECISE_BN.NUM_ITER,
+            )
+            if cfg.TEST.PRECISE_BN.ENABLED and get_bn_modules(self.model)
+            else None,
+        ]
+
+        # Do PreciseBN before checkpointer, because it updates the model and need to
+        # be saved by checkpointer.
+        # This is not always the best: if checkpointing has a different frequency,
+        # some checkpoints may have more precise statistics than others.
+        if comm.is_main_process():
+            ret.append(
+                hooks.PeriodicCheckpointer(
+                    self.checkpointer, cfg.SOLVER.CHECKPOINT_PERIOD
+                )
+            )
+
+        def test_and_save_results_student():
+            self._last_eval_results_student = self.test(self.cfg, self.model)
+            _last_eval_results_student = {
+                k + "_student": self._last_eval_results_student[k]
+                for k in self._last_eval_results_student.keys()
+            }
+            return _last_eval_results_student
+
+        def test_and_save_results_teacher():
+            self._last_eval_results_teacher = self.test(
+                self.cfg, self.model_teacher)
+            return self._last_eval_results_teacher
+
+        ret.append(hooks.EvalHook(cfg.TEST.EVAL_PERIOD,
+                   test_and_save_results_student))
+        ret.append(
+                BestCheckpointer(
+                    cfg.TEST.EVAL_PERIOD, 
+                    self.checkpointer, 
+                    'bbox_student/AP', 
+                    'max', 
+                    'Studentmodel_best'
+                )
+            )
+        if comm.is_main_process():
+            # run writers in the end, so that evaluation metrics are written
+            ret.append(hooks.PeriodicWriter(self.build_writers(), period=20))
+            
         return ret

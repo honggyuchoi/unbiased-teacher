@@ -15,6 +15,9 @@ from detectron2.modeling.roi_heads.fast_rcnn import (
 )
 
 from detectron2.utils.events import EventStorage
+from detectron2.utils.events import get_event_storage
+
+from ubteacher.modeling.box_regression import Box2BoxTransform_XYXY
 
 
 ##########################
@@ -312,21 +315,32 @@ class MoCoOutputLayers(FastRCNNOutputLayers):
 # Follow the Bounding Box Regression with Uncertainty for Accurate Object Detection
 # https://github.com/yihui-he/KL-Loss/blob/master/detectron/modeling/fast_rcnn_heads.py
 class FastRCNNUncertaintyOutputLayers(FastRCNNOutputLayers):
-    def __init__(self, cfg, input_shape):
+    def __init__(self, cfg, input_shape, cls_loss_type="FocalLoss", box_encode_type="xywh"):
         super(FastRCNNUncertaintyOutputLayers, self).__init__(cfg, input_shape)
 
         # Add uncertainty branch
         input_size = input_shape.channels * (input_shape.width or 1) * (input_shape.height or 1)
+        # class
         self.bbox_uncertainty = nn.Linear(input_size, self.num_classes * 4)
+
+        # Follow the bounding box uncertainty paper 
         nn.init.normal_(self.bbox_uncertainty.weight, std=0.0001)
         nn.init.constant_(self.bbox_uncertainty.bias, 0)
 
         self.loss_weight = {
             "loss_cls": cfg.MODEL.ROI_HEADS.BBOX_CLS_LOSS_WEIGHT,
-            "loss_box_reg": cfg.MODEL.ROI_HEADS.BBOX_REG_UNCERTAINTY_LOSS_WEIGHT
+            "loss_box_reg": cfg.MODEL.ROI_HEADS.BBOX_REG_UNCERTAINTY_LOSS_WEIGHT,
+            "loss_box_reg_first_term": cfg.MODEL.ROI_HEADS.BBOX_REG_UNCERTAINTY_LOSS_WEIGHT,
+            "loss_box_reg_second_term": cfg.MODEL.ROI_HEADS.BBOX_REG_UNCERTAINTY_LOSS_WEIGHT
         }
         self.uncertainty_loss_regularization_weight = cfg.MODEL.ROI_HEADS.BBOX_REG_UNCERTAINTY_LOSS_REGULARIZATION_WEIGHT
 
+        self.cls_loss_type = cls_loss_type
+
+        self.uncertainty_start_iter = cfg.MODEL.ROI_HEADS.UNCERTAINTY_START_ITER
+        
+        if box_encode_type == "xyxy":
+            self.box2box_transform = Box2BoxTransform_XYXY(weights=cfg.MODEL.ROI_BOX_HEAD.BBOX_REG_WEIGHTS)
     def forward(self, x):
         """
         Args:
@@ -349,7 +363,7 @@ class FastRCNNUncertaintyOutputLayers(FastRCNNOutputLayers):
         return scores, proposal_deltas, proposal_deltas_uncertainty
 
     # NegativeLogLikelihoodLoss
-    def box_reg_loss(self, proposal_boxes, gt_boxes, pred_deltas, pred_deltas_variance, gt_classes, beta=1.0):
+    def box_reg_loss(self, proposal_boxes, gt_boxes, pred_deltas, pred_deltas_variance, gt_classes, beta=1.0, warmup=False):
         """
         Args:
             proposal_boxes/gt_boxes are tensors with the same shape (R, 4 or 5).
@@ -364,6 +378,7 @@ class FastRCNNUncertaintyOutputLayers(FastRCNNOutputLayers):
             fg_pred_deltas = pred_deltas[fg_inds]
             fg_pred_deltas_variance = pred_deltas_variance[fg_inds]
         else:
+            # select foreground sample and assigned classes
             fg_pred_deltas = pred_deltas.view(-1, self.num_classes, box_dim)[
                 fg_inds, gt_classes[fg_inds]
             ]
@@ -371,7 +386,20 @@ class FastRCNNUncertaintyOutputLayers(FastRCNNOutputLayers):
                 fg_inds, gt_classes[fg_inds]
             ] 
 
-        loss_box_reg = self.UncertaintyLoss(
+        if warmup == True:
+            loss = self.SmoothL1Loss(
+               anchors=[proposal_boxes[fg_inds]],
+                box2box_transform=self.box2box_transform,
+                pred_anchor_deltas=[fg_pred_deltas.unsqueeze(0)],
+                pred_anchor_deltas_variance=[fg_pred_deltas_variance.unsqueeze(0)],
+                gt_boxes=[gt_boxes[fg_inds]],
+                fg_mask=...,
+                beta=beta, 
+            )
+            normalizer = max(gt_classes.numel(), 1.0)
+            return loss / normalizer
+
+        first_term, second_term = self.UncertaintyLoss(
             anchors=[proposal_boxes[fg_inds]],
             box2box_transform=self.box2box_transform,
             pred_anchor_deltas=[fg_pred_deltas.unsqueeze(0)],
@@ -380,19 +408,34 @@ class FastRCNNUncertaintyOutputLayers(FastRCNNOutputLayers):
             fg_mask=...,
             beta=beta,
         )
-        # The reg loss is normalized using the total number of regions (R), not the number
-        # of foreground regions even though the box regression loss is only defined on
-        # foreground regions. Why? Because doing so gives equal training influence to
-        # each foreground example. To see how, consider two different minibatches:
-        #  (1) Contains a single foreground region
-        #  (2) Contains 100 foreground regions
-        # If we normalize by the number of foreground regions, the single example in
-        # minibatch (1) will be given 100 times as much influence as each foreground
-        # example in minibatch (2). Normalizing by the total number of regions, R,
-        # means that the single example in minibatch (1) and each of the 100 examples
-        # in minibatch (2) are given equal influence.
-            
-        return loss_box_reg / max(gt_classes.numel(), 1.0)  # return 0 if empty
+        normalizer = max(gt_classes.numel(), 1.0)
+        return first_term / normalizer, second_term / normalizer  # return 0 if empty
+
+    def SmoothL1Loss(
+        self,
+        anchors: List[Union[Boxes, torch.Tensor]],
+        box2box_transform: Box2BoxTransform,
+        pred_anchor_deltas: List[torch.Tensor],
+        pred_anchor_deltas_variance: List[torch.Tensor], # log(variance**2)
+        gt_boxes: List[torch.Tensor],
+        fg_mask:torch.Tensor,
+        beta: float = 1.0,
+    ):
+        if isinstance(anchors[0], Boxes):
+            anchors = type(anchors[0]).cat(anchors).tensor  # (R, 4)
+        else:
+            anchors = torch.cat(anchors)
+
+        gt_anchor_deltas = [box2box_transform.get_deltas(anchors, k) for k in gt_boxes]
+        gt_anchor_deltas = torch.stack(gt_anchor_deltas)  # (N, R, 4)
+      
+        loss_box_reg = smooth_l1_loss(
+            torch.cat(pred_anchor_deltas, dim=1)[fg_mask],
+            gt_anchor_deltas[fg_mask],
+            beta=1.0,
+            reduction="none",
+        )
+        return loss_box_reg.sum()
 
     def UncertaintyLoss(
         self,
@@ -421,9 +464,12 @@ class FastRCNNUncertaintyOutputLayers(FastRCNNOutputLayers):
         pred_anchor_deltas_variance = torch.cat(pred_anchor_deltas_variance, dim=1)[fg_mask]
         first_term = loss_box_reg * torch.exp(-pred_anchor_deltas_variance)
         second_term =  pred_anchor_deltas_variance * self.uncertainty_loss_regularization_weight
-        loss_box_reg = first_term + second_term
+        # 0.5 is default value of the uncertainty_loss_regularization_Weight 
+        #loss_box_reg = first_term + second_term
 
-        return loss_box_reg.sum()
+        #return loss_box_reg.sum()
+
+        return first_term.sum(), second_term.sum()
 
     def losses(self, predictions, proposals):
         """
@@ -443,7 +489,7 @@ class FastRCNNUncertaintyOutputLayers(FastRCNNOutputLayers):
             torch.cat([p.gt_classes for p in proposals], dim=0) if len(proposals) else torch.empty(0)
         )
         _log_classification_stats(scores, gt_classes)
-
+        
         # parse box regression outputs
         if len(proposals):
             proposal_boxes = torch.cat([p.proposal_boxes.tensor for p in proposals], dim=0)  # Nx4
@@ -459,14 +505,47 @@ class FastRCNNUncertaintyOutputLayers(FastRCNNOutputLayers):
         else:
             proposal_boxes = gt_boxes = torch.empty((0, 4), device=proposal_deltas.device)
 
-        losses = {
-            "loss_cls": cross_entropy(scores, gt_classes, reduction="mean"),
-            "loss_box_reg": self.box_reg_loss(
-                proposal_boxes, gt_boxes, proposal_deltas, proposal_deltas_uncertainty, gt_classes
-            ),
-        }
-        return {k: v * self.loss_weight.get(k, 1.0) for k, v in losses.items()}
+        if self.cls_loss_type == "CrossEntropy":
+            loss_cls = cross_entropy(scores, gt_classes, reduction="mean")
 
+        elif self.cls_loss_type == "FocalLoss":
+            loss_cls = FastRCNNFocalLoss(
+                self.box2box_transform,
+                scores,
+                proposal_deltas,
+                proposals,
+                self.smooth_l1_beta,
+                self.box_reg_loss_type,
+                num_classes=self.num_classes,
+            ).comput_focal_loss()
+        else:
+            raise NotImplementedError
+
+        storage = get_event_storage()
+
+        if storage.iter > self.uncertainty_start_iter:
+            first_term, second_term = self.box_reg_loss(
+                        proposal_boxes, gt_boxes, proposal_deltas, proposal_deltas_uncertainty, gt_classes
+                    )
+
+            losses = {
+                'loss_cls': loss_cls,
+                "loss_box_reg": first_term + second_term,
+                "loss_box_reg_first_term": first_term.detach(),
+                "loss_box_reg_second_term": second_term.detach(), 
+            }
+            return {k: v * self.loss_weight.get(k, 1.0) for k, v in losses.items()}
+        else:
+            loss_reg = self.box_reg_loss(
+                        proposal_boxes, gt_boxes, proposal_deltas, proposal_deltas_uncertainty, gt_classes, warmup=True
+                    )
+            losses = {
+                'loss_cls': loss_cls,
+                "loss_box_reg": loss_reg
+            }
+            return {k: v * self.loss_weight.get(k, 1.0) for k, v in losses.items()}
+
+        
     def inference(self, predictions: Tuple[torch.Tensor, torch.Tensor], proposals: List[Instances]):
         """
         Args:

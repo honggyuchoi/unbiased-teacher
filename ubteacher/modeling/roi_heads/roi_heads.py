@@ -628,6 +628,7 @@ class StandardROIHeadsPseudoLabUncertainty(StandardROIHeads):
         pooler_scales     = tuple(1.0 / input_shape[k].stride for k in in_features)
         sampling_ratio    = cfg.MODEL.ROI_BOX_HEAD.POOLER_SAMPLING_RATIO
         pooler_type       = cfg.MODEL.ROI_BOX_HEAD.POOLER_TYPE
+        box_encode_type   = cfg.MODEL.ROI_BOX_HEAD.BOX_ENCODE_TYPE
         # fmt: on
 
         in_channels = [input_shape[f].channels for f in in_features]
@@ -649,9 +650,9 @@ class StandardROIHeadsPseudoLabUncertainty(StandardROIHeads):
         )
         
         if cfg.MODEL.ROI_HEADS.LOSS == "CrossEntropy":
-            box_predictor = FastRCNNUncertaintyOutputLayers(cfg, box_head.output_shape)
+            box_predictor = FastRCNNUncertaintyOutputLayers(cfg, box_head.output_shape, 'CrossEntropy', box_encode_type)
         elif cfg.MODEL.ROI_HEADS.LOSS == "FocalLoss":
-            raise NotImplementedError
+            box_predictor = FastRCNNUncertaintyOutputLayers(cfg, box_head.output_shape, 'FocalLoss', box_encode_type)
         else:
             raise ValueError("Unknown ROI head loss.")
 
@@ -678,7 +679,7 @@ class StandardROIHeadsPseudoLabUncertainty(StandardROIHeads):
             assert targets
             # 1000 --> 512
             proposals = self.label_and_sample_proposals(
-                proposals, targets, branch=branch
+                proposals, targets
             )
         elif compute_val_loss:  # apply if val loss
             assert targets
@@ -686,7 +687,7 @@ class StandardROIHeadsPseudoLabUncertainty(StandardROIHeads):
             temp_proposal_append_gt = self.proposal_append_gt
             self.proposal_append_gt = False
             proposals = self.label_and_sample_proposals(
-                proposals, targets, branch=branch
+                proposals, targets
             )  # do not apply target on proposals
             self.proposal_append_gt = temp_proposal_append_gt
         del targets
