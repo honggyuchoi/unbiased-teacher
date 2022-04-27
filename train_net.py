@@ -35,6 +35,10 @@ def setup(args):
     default_setup(cfg, args)
     return cfg
 
+def user_argument_parser(parser):
+    parser.add_argument('--eval_student', action='store_true')
+
+    return parser
 
 def main(args):
     cfg = setup(args)
@@ -62,8 +66,11 @@ def main(args):
             DetectionCheckpointer(
                 ensem_ts_model, save_dir=cfg.OUTPUT_DIR
             ).resume_or_load(cfg.MODEL.WEIGHTS, resume=args.resume)
-            #res = Trainer.test(cfg, ensem_ts_model.modelStudent)
-            res = Trainer.test(cfg, ensem_ts_model.modelTeacher)
+            
+            if args.eval_student:
+                res = Trainer.test(cfg, ensem_ts_model.modelStudent)
+            else:
+                res = Trainer.test(cfg, ensem_ts_model.modelTeacher)
 
         else:
             model = Trainer.build_model(cfg)
@@ -80,7 +87,8 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = default_argument_parser().parse_args()
+    parser = default_argument_parser()
+    args = user_argument_parser(parser).parse_args()
 
     print("Command Line Args:", args)
     launch(
