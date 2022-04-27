@@ -37,8 +37,12 @@ from ubteacher.modeling.meta_arch.ts_ensemble import EnsembleTSModel
 from ubteacher.data.dataset_mapper import VisualizeMapper 
 from detectron2.data import (
     MetadataCatalog,
+)
+from ubteacher.data.build import(
+    build_detection_semisup_train_loader,
     build_detection_test_loader,
-    build_detection_train_loader,
+    build_detection_semisup_train_loader_two_crops,
+    build_detection_semisup_train_loader
 )
 
 from typing import Dict, List, Optional, Tuple
@@ -47,6 +51,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 import seaborn as sn
+import pdb
 
 
 def setup(args):
@@ -73,12 +78,12 @@ coco_names = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'trai
 
 voc_names =  ['aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus', 'car', 'cat', 'chair', 'cow', 'diningtable', 'dog',
         'horse', 'motorbike', 'person', 'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'] 
-
-def visualize_iou_uncertainty(cfg, model, datasets='coco'):
+@torch.no_grad()
+def visualize_iou_uncertainty(cfg, model, Trainer, datasets='coco'):
     mapper = VisualizeMapper(cfg, is_train=False)
-    data_loader = build_detection_test_loader(cfg, cfg.DATASETS.TEST[0], mapper=mapper)
+    data_loader = build_detection_test_loader(cfg, cfg.DATASETS.TRAIN[0], mapper=mapper)
     
-    model.eval()
+
     output_dir = f'./visualize_correlation'
     os.makedirs(output_dir, exist_ok=True)
     model_name =  cfg.MODEL.WEIGHTS
@@ -101,49 +106,78 @@ def visualize_iou_uncertainty(cfg, model, datasets='coco'):
     uncertainty_y2_list = []
     uncertainty_mean_list = []
     iou_list = []
+    cur_threshold = 0.7
     for idx, inputs in enumerate(data_loader):
+       
         # import pdb
         # pdb.set_trace()
         if idx % 10 == 0:
             print('idx: ', idx)
-        results = model(inputs)
-
+        _, _, proposals_roih, _ = model(inputs, branch="unsup_data_weak")
         if "instances" in inputs[0]:
             gt_instances = [x["instances"].to('cuda') for x in inputs]
 
-        for predictions_per_image, targets_per_image in zip(results, gt_instances):
-            has_gt = len(targets_per_image) > 0
-            match_quality_matrix = pairwise_iou(targets_per_image.gt_boxes, predictions_per_image.pred_boxes)
+        for predictions_per_image, targets_per_image in zip(proposals_roih, gt_instances):
             
-            match_class = torch.eq(targets_per_image.gt_classes.view(-1,1), predictions_per_image.pred_classes.view(1.-1))
+            has_gt = len(targets_per_image) > 0
+            select = predictions_per_image.scores > cur_threshold
 
+            if select.sum() == 0:
+                continue
+            match_quality_matrix = pairwise_iou(targets_per_image.gt_boxes, predictions_per_image.pred_boxes[select])
+            match_class = torch.eq(targets_per_image.gt_classes.view(-1,1), predictions_per_image.pred_classes[select].view(1,-1))
             match_quality_matrix = match_quality_matrix * match_class 
-
+            
             if has_gt:
                 matched_vals, matched_idx = match_quality_matrix.max(dim=0)
             else:
                 matched_vals = torch.zeros(match_quality_matrix.shape[1]).to(match_quality_matrix.device)
 
             iou_list.append(matched_vals.view(-1))
-            uncertainty_list(predictions_per_image.uncertainties.view(-1))
+            uncertainties = predictions_per_image.uncertainties[select]
+            uncertainty_x1_list.append(uncertainties[:,0].view(-1))
+            uncertainty_y1_list.append(uncertainties[:,1].view(-1))
+            uncertainty_x2_list.append(uncertainties[:,2].view(-1))
+            uncertainty_y2_list.append(uncertainties[:,3].view(-1))
+            uncertainty_mean_list.append(uncertainties.mean(dim=1))
+        
+    iou_list = torch.cat(iou_list, dim=0).cpu().numpy()
+    uncertainty_x1_list = torch.cat(uncertainty_x1_list, dim=0).cpu().numpy()
+    uncertainty_y1_list = torch.cat(uncertainty_y1_list, dim=0).cpu().numpy()
+    uncertainty_x2_list = torch.cat(uncertainty_x2_list, dim=0).cpu().numpy()
+    uncertainty_y2_list = torch.cat(uncertainty_y2_list, dim=0).cpu().numpy()
+    uncertainty_mean_list = torch.cat(uncertainty_mean_list, dim=0).cpu().numpy()
 
-    iou_list = torch.cat(iou_list, dim=0)
-    uncertainty_x1_list = torch.cat(uncertainty_x1_list, dim=0)
-    uncertainty_y1_list = torch.cat(uncertainty_y1_list, dim=0)
-    uncertainty_x2_list = torch.cat(uncertainty_x2_list, dim=0)
-    uncertainty_y2_list = torch.cat(uncertainty_y2_list, dim=0)
-    uncertainty_mean_list = torch.cat(uncertainty_mean_list, dim=0)
-
-
-    
     # x1, y1, x2, y2, mean
-    fig, axes = plt.subplot(3,2)
-    
-    axes[0,0].scatter
+    plt.subplot(3,2,1)    
+    plt.scatter(uncertainty_x1_list, iou_list, s=1, alpha=0.6)
+    plt.xscale('log')
+    plt.title('x1')
 
-    plot.scatter(data[idx,0], data[idx,1], s=10, alpha=0.6, color=plt.cm.tab20(i / 20))
+    plt.subplot(3,2,2)
+    plt.scatter(uncertainty_y1_list, iou_list, s=1, alpha=0.6)
+    plt.xscale('log')
+    plt.title('y1')
 
+    plt.subplot(3,2,3)
+    plt.scatter(uncertainty_x2_list, iou_list, s=1, alpha=0.6)
+    plt.xscale('log')
+    plt.title('x2')
 
+    plt.subplot(3,2,4)
+    plt.scatter(uncertainty_y2_list, iou_list, s=1, alpha=0.6)
+    plt.xscale('log')
+    plt.title('y2')
+
+    plt.subplot(3,2,5)
+    plt.scatter(uncertainty_mean_list, iou_list, s=1, alpha=0.6)
+    plt.xscale('log')
+    plt.title('mean')
+
+    plt.tight_layout()
+    plt.savefig(Path(output_dir) /  f'iou-uncertainty_{model_name}.png', dpi=250) 
+
+@torch.no_grad()
 def visualize_cosine_sim(cfg, model, datasets='voc'):
     # build dataloader(has annotation)
     mapper = VisualizeMapper(cfg, is_train=False)
@@ -227,7 +261,7 @@ def visualize_cosine_sim(cfg, model, datasets='voc'):
                 yticklabels=names).set_facecolor((1, 1, 1))
     fig.tight_layout()
     fig.savefig(Path(output_dir) /  f'cosine_mat_{model_name}.png', dpi=250)  
-
+@torch.no_grad()
 def visualize_confusion_mat(cfg, model, datasets='coco', score_threshold=0.1, iou_threshold=0.5, ignore_background=False, normalize="row"):
     '''
         model: evaluated model
@@ -342,7 +376,7 @@ def visualize_confusion_mat(cfg, model, datasets='coco', score_threshold=0.1, io
     
 
 
-
+@torch.no_grad()
 def visualize_tsne(cfg, model):
     # build dataloader(has annotation)
     mapper = VisualizeMapper(cfg, is_train=False)
@@ -387,7 +421,7 @@ def visualize_tsne(cfg, model):
         embeded_features_classes.extend(foreground_box_classes.detach().cpu().numpy())
         
     return np.array(embeded_features), np.array(embeded_features_classes)    
-
+@torch.no_grad()
 def visualize_proposals(cfg, model):
     # build dataloader(has annotation)
     mapper = VisualizeMapper(cfg, is_train=False)
@@ -500,7 +534,7 @@ def visualize_predictions(cfg, model):
         v.save(output_dir + f'/testing_image_{idx}.png')
         if idx == 100:
             break
-
+@torch.no_grad()
 def label_and_proposals(proposals, targets, box_features, roi_heads):
     if box_features.dim() > 2:
         box_features = torch.flatten(box_features, start_dim=1)
@@ -524,7 +558,7 @@ def label_and_proposals(proposals, targets, box_features, roi_heads):
         # )
 
         return foreground_box_features, foreground_box_classes
-
+@torch.no_grad()
 def plot_embedding(plot, data, label, dataset, plot_num, show=None):
     # param data:data
     # param label:label
@@ -615,28 +649,39 @@ def main(args):
             cfg.MODEL.WEIGHTS, resume=args.resume
         )
 
-    test_model = model_teacher
-    # test_model = model_teacher
-    if cfg.VISUALIZATION.TYPE == "rpn":
-        visualize_proposals(cfg, test_model)
-    elif cfg.VISUALIZATION.TYPE == "roi":
-        visualize_predictions(cfg, test_model)
-    elif cfg.VISUALIZATION.TYPE == "tsne":
-        visualize_tsne(cfg, test_model)
-    elif cfg.VISUALIZATION.TYPE == "conf_mat":
-        visualize_confusion_mat(cfg, test_model, 'coco', )
-    elif cfg.VISUALIZATION.TYPE == "cosine_sim":
-        visualize_cosine_sim(cfg, test_model)
-    elif cfg.VISUALIZATION.TYPE == "umap":
-        visualize_umap(cfg, test_model)
-    elif cfg.VISUALIZATION.TYPE == "iou_uncertainty":
-        visualize_iou_uncertainty(cfg, test_model)
+    if args.test_model == "teacher":
+        test_model = model_teacher
+    elif args.test_model == "student":
+        test_model = model
     else:
         raise NotImplementedError
-    
+
+    if args.vis_type == "rpn":
+        visualize_proposals(cfg, test_model)
+    elif args.vis_type == "roi":
+        visualize_predictions(cfg, test_model)
+    elif args.vis_type == "tsne":
+        visualize_tsne(cfg, test_model)
+    elif args.vis_type == "conf_mat":
+        visualize_confusion_mat(cfg, test_model, args.dataset)
+    elif args.vis_type == "cosine_sim":
+        visualize_cosine_sim(cfg, test_model, args.dataset)
+    elif args.vis_type == "umap":
+        visualize_umap(cfg, test_model, args.dataset)
+    elif args.vis_type == "iou_uncertainty":
+        visualize_iou_uncertainty(cfg, test_model, Trainer, args.dataset)
+    else:
+        raise NotImplementedError
+
+def user_argument_parser(parser):
+    parser.add_argument('--vis_type', type=str)
+    parser.add_argument('--dataset', type=str)
+    parser.add_argument('--test_model', type=str)
+    return parser
 
 if __name__ == "__main__":
-    args = default_argument_parser().parse_args()
+    parser = default_argument_parser()
+    args = user_argument_parser(parser).parse_args()
 
     print("Command Line Args:", args)
     launch(
