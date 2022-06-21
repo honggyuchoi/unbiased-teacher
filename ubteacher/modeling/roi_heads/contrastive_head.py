@@ -35,9 +35,9 @@ class Projector(nn.Module):
     def __init__(self, dim_in=1024, hidden_dim=2048, feat_dim=128):
         super().__init__()
         self.head = nn.Sequential(
-            nn.Linear(dim_in, hidden_dim), # 1024, 1024
+            nn.Linear(dim_in, hidden_dim, bias=False), # 1024, 1024
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, feat_dim), # 1024, 128 
+            nn.Linear(hidden_dim, feat_dim, bias=False), # 1024, 128 
         )
         for layer in self.head:
             if isinstance(layer, nn.Linear):
@@ -49,14 +49,16 @@ class Projector(nn.Module):
         return feat
         
 # Two fc layers with batchnorm and relu
+# projector and predictor architeture is same as mocov3
 class Projector_bn(nn.Module):
     def __init__(self, dim_in=1024, hidden_dim=2048, feat_dim=128):
         super().__init__()
         self.head = nn.Sequential(
-            nn.Linear(dim_in, hidden_dim), # 1024, 1024
+            nn.Linear(dim_in, hidden_dim, bias=False), # 1024, 1024
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, feat_dim), # 1024, 128 
+            nn.Linear(hidden_dim, feat_dim, bias=False), # 1024, 128 
+            nn.BatchNorm1d(feat_dim, affine=False),
         )
         for layer in self.head:
             if isinstance(layer, nn.Linear):
@@ -72,9 +74,9 @@ class Predictor(nn.Module):
     def __init__(self, dim_in=128, hidden_dim=2048, feat_dim=128):
         super().__init__()
         self.head = nn.Sequential(
-            nn.Linear(dim_in, hidden_dim), # 128, 1024
+            nn.Linear(dim_in, hidden_dim, bias=False), # 128, 1024
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, feat_dim), # 1024, 128 
+            nn.Linear(hidden_dim, feat_dim, bias=False), # 1024, 128 
         )
         for layer in self.head:
             if isinstance(layer, nn.Linear):
@@ -90,10 +92,10 @@ class Predictor_bn(nn.Module):
     def __init__(self, dim_in=128, hidden_dim=2048, feat_dim=128):
         super().__init__()
         self.head = nn.Sequential(
-            nn.Linear(dim_in, hidden_dim), # 1024, 1024
+            nn.Linear(dim_in, hidden_dim, bias=False), # 1024, 1024
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, feat_dim), # 1024, 128 
+            nn.Linear(hidden_dim, feat_dim, bias=False), # 1024, 128 
         )
         for layer in self.head:
             if isinstance(layer, nn.Linear):

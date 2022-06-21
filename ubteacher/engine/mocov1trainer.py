@@ -37,10 +37,11 @@ from ubteacher.modeling.meta_arch.ts_ensemble import EnsembleTSModel
 from ubteacher.checkpoint.detection_checkpoint import DetectionTSCheckpointer
 from ubteacher.solver.build import build_lr_scheduler
 from ubteacher.utils import ClasswiseFeatureQueue
+from ubteacher.engine.trainer import UBTeacherTrainer
 
 # MoCov1
 # backbone과 roi head 모두 teacher
-class MoCov1Trainer(DefaultTrainer):
+class MoCov1Trainer(UBTeacherTrainer):
     def __init__(self, cfg):
         """
         1. labeled data
@@ -53,9 +54,6 @@ class MoCov1Trainer(DefaultTrainer):
         Use the custom checkpointer, which loads other backbone models
         with matching heuristics.
         """
-        cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
-        data_loader = self.build_train_loader(cfg)
-
         # create an student model
         model = self.build_model(cfg)
         optimizer = self.build_optimizer(cfg, model)
@@ -69,8 +67,6 @@ class MoCov1Trainer(DefaultTrainer):
             model = DistributedDataParallel(
                 model, device_ids=[comm.get_local_rank()], broadcast_buffers=False
             )
-
-        TrainerBase.__init__(self)
         self._trainer = (AMPTrainer if cfg.SOLVER.AMP.ENABLED else SimpleTrainer)(
             model, data_loader, optimizer
         )
@@ -116,180 +112,6 @@ class MoCov1Trainer(DefaultTrainer):
         self.register_hooks(self.build_hooks())
 
         self.warmup_ema = cfg.MOCO.WARMUP_EMA # If true, EMA parameter 0.5 -> 0.9996
-
-    def resume_or_load(self, resume=True):
-        """
-        If `resume==True` and `cfg.OUTPUT_DIR` contains the last checkpoint (defined by
-        a `last_checkpoint` file), resume from the file. Resuming means loading all
-        available states (eg. optimizer and scheduler) and update iteration counter
-        from the checkpoint. ``cfg.MODEL.WEIGHTS`` will not be used.
-        Otherwise, this is considered as an independent training. The method will load model
-        weights from the file `cfg.MODEL.WEIGHTS` (but will not load other states) and start
-        from iteration 0.
-        Args:
-            resume (bool): whether to do resume or not
-        """
-        
-        checkpoint = self.checkpointer.resume_or_load(
-            self.cfg.MODEL.WEIGHTS, resume=resume
-        )
-        if resume and self.checkpointer.has_checkpoint():
-            self.start_iter = checkpoint.get("iteration", -1) + 1
-            # The checkpoint stores the training iteration that just finished, thus we start
-            # at the next iteration (or iter zero if there's no checkpoint).
-        if self.cfg.MODEL.WEIGHTS and self.cfg.MOCO.RESUME_AFTER_BURNUP:
-            self.start_iter = checkpoint['scheduler'].get('last_epoch', -1) + 1
-            checkpoint = self.checkpointer._load_optimizer_scheduler(checkpoint)
-            self.ensem_ts_model._init_queue(self.queue_size, self.contrastive_feature_dim, self.classwise_queue)
-        
-        if isinstance(self.model, DistributedDataParallel):
-            # broadcast loaded data/model from the first rank, because other
-            # machines may not have access to the checkpoint file
-            if TORCH_VERSION >= (1, 7):
-                self.model._sync_params_and_buffers()
-            self.start_iter = comm.all_gather(self.start_iter)[0]
-
-    @classmethod
-    def build_evaluator(cls, cfg, dataset_name, output_folder=None):
-        if output_folder is None:
-            output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
-        evaluator_list = []
-        evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
-        
-        if cfg.TEST.EVALUATOR == "coco" or cfg.TEST.EVALUATOR == "cocoEVAL":
-            evaluator_list.append(COCOEvaluator(
-                dataset_name, output_dir=output_folder))
-            return evaluator_list[0]
-        elif cfg.TEST.EVALUATOR == "voc":
-            return PascalVOCDetectionEvaluator(dataset_name)
-  
-        if evaluator_type == "coco":
-            evaluator_list.append(COCOEvaluator(
-                dataset_name, output_dir=output_folder))
-        elif evaluator_type == "pascal_voc":
-            return PascalVOCDetectionEvaluator(dataset_name)
-        if len(evaluator_list) == 0:
-            raise NotImplementedError(
-                "no Evaluator for the dataset {} with the type {}".format(
-                    dataset_name, evaluator_type
-                )
-            )
-        elif len(evaluator_list) == 1:
-            return evaluator_list[0]
-
-        return DatasetEvaluators(evaluator_list)
-
-    @classmethod
-    def build_train_loader(cls, cfg):
-        mapper = DatasetMapperTwoCropSeparate(cfg, True)
-        return build_detection_semisup_train_loader_two_crops(cfg, mapper)
-
-    @classmethod
-    def build_lr_scheduler(cls, cfg, optimizer):
-        return build_lr_scheduler(cfg, optimizer)
-
-    def train(self):
-        self.train_loop(self.start_iter, self.max_iter)
-        if hasattr(self, "_last_eval_results") and comm.is_main_process():
-            verify_results(self.cfg, self._last_eval_results)
-            return self._last_eval_results
-
-    def train_loop(self, start_iter: int, max_iter: int):
-        logger = logging.getLogger(__name__)
-        logger.info("Starting training from iteration {}".format(start_iter))
-
-        self.iter = self.start_iter = start_iter
-        self.max_iter = max_iter
-
-        with EventStorage(start_iter) as self.storage:
-            try:
-                self.before_train()
-
-                for self.iter in range(start_iter, max_iter):
-                    self.before_step()
-                    self.run_step_full_semisup()
-                    # save model end of burnup stage
-                    if self.iter + 1 == self.cfg.SEMISUPNET.BURN_UP_STEP:
-                        self.checkpointer.save('model_burnup')
-                    self.after_step()
-            except Exception:
-                logger.exception("Exception during training:")
-                raise
-            finally:
-                self.after_train()
-
-    # =====================================================
-    # ================== Pseduo-labeling ==================
-    # =====================================================
-    def threshold_bbox(self, proposal_bbox_inst, thres=0.7, proposal_type="roih"):
-        if proposal_type == "rpn":
-            # filtered by objectness score
-            #valid_map = proposal_bbox_inst.objectness_logits > thres
-            
-            # objectness_logits is not score!!
-            objectness_scores = torch.sigmoid(proposal_bbox_inst.objectness_logits)
-            valid_map = (objectness_scores > thres)
-
-            # create instances containing boxes and gt_classes
-            image_shape = proposal_bbox_inst.image_size
-            new_proposal_inst = Instances(image_shape)
-
-            # create box
-            new_bbox_loc = proposal_bbox_inst.proposal_boxes.tensor[valid_map, :]
-            new_boxes = Boxes(new_bbox_loc)
-
-            # add boxes to instances
-            new_proposal_inst.gt_boxes = new_boxes
-            new_proposal_inst.objectness_logits = proposal_bbox_inst.objectness_logits[
-                valid_map
-            ]
-        elif proposal_type == "roih":
-            # filtered by objectness? classsification score?
-            valid_map = proposal_bbox_inst.scores > thres
-
-            # create instances containing boxes and gt_classes
-            image_shape = proposal_bbox_inst.image_size
-            new_proposal_inst = Instances(image_shape)
-
-            # create box
-            new_bbox_loc = proposal_bbox_inst.pred_boxes.tensor[valid_map, :]
-            new_boxes = Boxes(new_bbox_loc)
-
-            # add boxes to instances
-            new_proposal_inst.gt_boxes = new_boxes
-            new_proposal_inst.gt_classes = proposal_bbox_inst.pred_classes[valid_map]
-            new_proposal_inst.scores = proposal_bbox_inst.scores[valid_map]
-
-        return new_proposal_inst
-
-    def process_pseudo_label(
-        self, proposals_rpn_unsup_k, cur_threshold, proposal_type, psedo_label_method=""
-    ):
-        list_instances = []
-        num_proposal_output = 0.0
-        for proposal_bbox_inst in proposals_rpn_unsup_k:
-            # thresholding
-            if psedo_label_method == "thresholding":
-                proposal_bbox_inst = self.threshold_bbox(
-                    proposal_bbox_inst, thres=cur_threshold, proposal_type=proposal_type
-                )
-            else:
-                raise ValueError("Unknown pseudo label boxes methods")
-            num_proposal_output += len(proposal_bbox_inst)
-            list_instances.append(proposal_bbox_inst)
-        num_proposal_output = num_proposal_output / len(proposals_rpn_unsup_k) # per image
-        return list_instances, num_proposal_output
-
-    def remove_label(self, label_data):
-        for label_datum in label_data:
-            if "instances" in label_datum.keys():
-                del label_datum["instances"]
-        return label_data
-
-    def add_label(self, unlabled_data, label):
-        for unlabel_datum, lab_inst in zip(unlabled_data, label):
-            unlabel_datum["instances"] = lab_inst
-        return unlabled_data
 
     # =====================================================
     # =================== Training Flow ===================
@@ -492,80 +314,6 @@ class MoCov1Trainer(DefaultTrainer):
         self.optimizer.zero_grad()
         losses.backward()
         self.optimizer.step()
-
-    def _write_metrics(self, metrics_dict: dict):
-        metrics_dict = {
-            k: v.detach().cpu().item() if isinstance(v, torch.Tensor) else float(v)
-            for k, v in metrics_dict.items()
-        }
-
-        # gather metrics among all workers for logging
-        # This assumes we do DDP-style training, which is currently the only
-        # supported method in detectron2.
-        all_metrics_dict = comm.gather(metrics_dict)
-        # all_hg_dict = comm.gather(hg_dict)
-
-        if comm.is_main_process():
-            if "data_time" in all_metrics_dict[0]:
-                # data_time among workers can have high variance. The actual latency
-                # caused by data_time is the maximum among workers.
-                data_time = np.max([x.pop("data_time")
-                                   for x in all_metrics_dict])
-                self.storage.put_scalar("data_time", data_time)
-
-            # average the rest metrics
-            metrics_dict = {
-                k: np.mean([x[k] for x in all_metrics_dict])
-                for k in all_metrics_dict[0].keys()
-            }
-
-            # append the list
-            loss_dict = {}
-            for key in metrics_dict.keys():
-                if key[:4] == "loss":
-                    loss_dict[key] = metrics_dict[key]
-
-            total_losses_reduced = sum(loss for loss in loss_dict.values())
-
-            self.storage.put_scalar("total_loss", total_losses_reduced)
-            if len(metrics_dict) > 1:
-                self.storage.put_scalars(**metrics_dict)
-
-    @torch.no_grad()
-    def _update_teacher_model(self, keep_rate=0.996):
-        if comm.get_world_size() > 1:
-            student_model_dict = {
-                key[7:]: value for key, value in self.model.state_dict().items()
-            }
-        else:
-            student_model_dict = self.model.state_dict()
-
-        new_teacher_dict = OrderedDict()
-        for key, value in self.model_teacher.state_dict().items():
-            if key in student_model_dict.keys():
-                new_teacher_dict[key] = (
-                    student_model_dict[key] *
-                    (1 - keep_rate) + value * keep_rate
-                )
-            else:
-                raise Exception("{} is not found in student model".format(key))
-
-        self.model_teacher.load_state_dict(new_teacher_dict)
-
-    @torch.no_grad()
-    def _copy_main_model(self):
-        # initialize all parameters
-        if comm.get_world_size() > 1:
-            rename_model_dict = {
-                key[7:]: value for key, value in self.model.state_dict().items()
-            }
-            self.model_teacher.load_state_dict(rename_model_dict)
-        else:
-            self.model_teacher.load_state_dict(self.model.state_dict())
-
-    @classmethod
-    def build_test_loader(cls, cfg, dataset_name):
-        return build_detection_test_loader(cfg, dataset_name)
 
     def build_hooks(self):
         cfg = self.cfg.clone()

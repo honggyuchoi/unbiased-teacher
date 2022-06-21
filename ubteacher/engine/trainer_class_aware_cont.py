@@ -44,6 +44,7 @@ from ubteacher.solver.build import build_lr_scheduler
 
 from ubteacher.engine.trainer import UBTeacherTrainer
 
+from ubteacher.utils import box_jittering
 class Trainer_class_aware_cont(UBTeacherTrainer):
     def __init__(self, cfg):
         """
@@ -68,7 +69,7 @@ class Trainer_class_aware_cont(UBTeacherTrainer):
         if comm.get_world_size() > 1:
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
             model = DistributedDataParallel(
-                model, device_ids=[comm.get_local_rank()], broadcast_buffers=False,
+                model, device_ids=[comm.get_local_rank()], broadcast_buffers=True,
                 find_unused_parameters=True
             )
 
@@ -106,11 +107,92 @@ class Trainer_class_aware_cont(UBTeacherTrainer):
         # applying box jittering => kind of geometry augmentation
         # this can make training more hard, but could learn more sementic information
         self.box_jitter = self.cfg.MOCO.BOX_JITTERING
-        if self.box_jitter is True:
-            self.jitter_frac = 0.06
-            self.jitter_times = 1
-        self.cont_prediction_head = cfg.MOCO.CONT_PREDICTION_HEAD
+        self.jitter_frac = self.cfg.MOCO.JITTER_FRAC
+        self.jitter_times = self.cfg.MOCO.JITTER_TIMES
+
+        self.cont_prediction_head = self.cfg.MOCO.CONT_PREDICTION_HEAD
         self.feature_noise = False
+
+        # If True, apply contrastive learning
+        self.contrastive_learning = self.cfg.MOCO.CONTRASTIVE_LEARNING 
+        # If true, apply class-aware. If not True, apply self contrastive
+        self.class_aware_cont = self.cfg.MOCO.CLASS_AWARE_CONTRASTIVE
+
+        self.pseudo_label_reg = self.cfg.UNCERTAINTY.PSEUDO_LABEL_REG
+        self.uncertainty_threshold = self.cfg.UNCERTAINTY.UNCERTAINTY_THRESHOLD
+
+        # =====================================================
+    # ================== Pseduo-labeling ==================
+    # =====================================================
+    def threshold_bbox(self, proposal_bbox_inst, thres=0.7, proposal_type="roih"):
+        if proposal_type == "rpn":
+            #valid_map = proposal_bbox_inst.objectness_logits > thres
+
+            # objectness_logits is not score!!
+            objectness_scores = torch.sigmoid(proposal_bbox_inst.objectness_logits)
+            valid_map = (objectness_scores > thres)
+
+            # create instances containing boxes and gt_classes
+            image_shape = proposal_bbox_inst.image_size
+            new_proposal_inst = Instances(image_shape)
+
+            # create box
+            new_bbox_loc = proposal_bbox_inst.proposal_boxes.tensor[valid_map, :]
+            new_boxes = Boxes(new_bbox_loc)
+
+            # add boxes to instances
+            new_proposal_inst.gt_boxes = new_boxes
+            new_proposal_inst.objectness_logits = proposal_bbox_inst.objectness_logits[
+                valid_map
+            ]
+        elif proposal_type == "roih":
+            valid_map = proposal_bbox_inst.scores > thres
+
+            # create instances containing boxes and gt_classes
+            image_shape = proposal_bbox_inst.image_size
+            new_proposal_inst = Instances(image_shape)
+
+            # create box
+            new_bbox_loc = proposal_bbox_inst.pred_boxes.tensor[valid_map, :]
+            new_boxes = Boxes(new_bbox_loc)
+
+            # add boxes to instances
+            new_proposal_inst.gt_boxes = new_boxes
+            new_proposal_inst.gt_classes = proposal_bbox_inst.pred_classes[valid_map]
+            new_proposal_inst.scores = proposal_bbox_inst.scores[valid_map]
+            if proposal_bbox_inst.has('uncertainties'):
+                new_proposal_inst.gt_uncertainties = proposal_bbox_inst.uncertainties[valid_map]
+
+        return new_proposal_inst
+
+    def process_pseudo_label(
+        self, proposals_rpn_unsup_k, cur_threshold, proposal_type, psedo_label_method=""
+    ):
+        list_instances = []
+        num_proposal_output = 0.0
+        for proposal_bbox_inst in proposals_rpn_unsup_k:
+            # thresholding
+            if psedo_label_method == "thresholding":
+                proposal_bbox_inst = self.threshold_bbox(
+                    proposal_bbox_inst, thres=cur_threshold, proposal_type=proposal_type
+                )
+            else:
+                raise ValueError("Unkown pseudo label boxes methods")
+            num_proposal_output += len(proposal_bbox_inst)
+            list_instances.append(proposal_bbox_inst)
+        num_proposal_output = num_proposal_output / len(proposals_rpn_unsup_k)
+        return list_instances, num_proposal_output
+
+    def remove_label(self, label_data):
+        for label_datum in label_data:
+            if "instances" in label_datum.keys():
+                del label_datum["instances"]
+        return label_data
+
+    def add_label(self, unlabled_data, label):
+        for unlabel_datum, lab_inst in zip(unlabled_data, label):
+            unlabel_datum["instances"] = lab_inst
+        return unlabled_data
 
     # =====================================================
     # =================== Training Flow ===================
@@ -156,11 +238,12 @@ class Trainer_class_aware_cont(UBTeacherTrainer):
         data = next(self._trainer._data_loader_iter)
         # data_q and data_k from different augmentations (q:strong, k:weak)
         # label_strong, label_weak, unlabed_strong, unlabled_weak
+        
         label_data_q, label_data_k, unlabel_data_q, unlabel_data_q_2, unlabel_data_k = data # 각각 list
         data_time = time.perf_counter() - start
 
         # get real gt for statistic
-        gt_instances = [x["instances"].to(self.device) for x in unlabel_data_q]
+        # gt_instances = [x["instances"].to(self.device) for x in unlabel_data_q]
         # remove unlabeled data labels
         unlabel_data_q = self.remove_label(unlabel_data_q)
         unlabel_data_q_2 = self.remove_label(unlabel_data_q_2)
@@ -180,9 +263,12 @@ class Trainer_class_aware_cont(UBTeacherTrainer):
             # weight losses
             loss_dict = {}
             for key in record_dict.keys():
-                metrics_dict[key] = record_dict[key].item()
                 if key[:4] == "loss":
-                    loss_dict[key] = record_dict[key] * 1
+                    if (key == "loss_box_reg_first_term") or (key =="loss_box_reg_second_term"):
+                        metrics_dict[key] = record_dict[key].item()
+                    else:
+                        metrics_dict[key] = record_dict[key].item()
+                        loss_dict[key] = record_dict[key] * 1.0
             losses = sum(loss_dict.values())
 
             metrics_dict["data_time"] = data_time
@@ -196,6 +282,7 @@ class Trainer_class_aware_cont(UBTeacherTrainer):
             # init
             if self.iter == self.cfg.SEMISUPNET.BURN_UP_STEP:
                 # update copy the the whole model
+                print('teacher init!!')
                 self._update_teacher_model(keep_rate=0.00)
             # update
             elif (self.iter - self.cfg.SEMISUPNET.BURN_UP_STEP) % self.cfg.SEMISUPNET.TEACHER_UPDATE_ITER == 0:
@@ -205,30 +292,11 @@ class Trainer_class_aware_cont(UBTeacherTrainer):
                     alpha = min(1 - 1 / (global_step + 1), alpha) 
                 self._update_teacher_model(keep_rate=alpha)# hyperparameter.. should be tuned
 
-            # initialize
-            metrics_dict = {}
-            label_loss = 0.0
-            unlabel_loss = 0.0
-            self.optimizer.zero_grad()
-
             #############################
             #                           #
-            #    supervised learning    #
+            #  Generate pseudo label    #
             #                           #
             #############################
-            # prepare data 
-            all_label_data = label_data_q + label_data_k 
-            # supervised learning with label data
-            record_all_label_data, _, _, _ = self.model(
-                all_label_data, branch="supervised"
-            )
-            for key in record_all_label_data.keys():
-                metrics_dict[key] = record_all_label_data[key].item()
-                label_loss += record_all_label_data[key]
-            label_loss.backward()
-            del label_loss, record_all_label_data, label_data_q, label_data_k, all_label_data
-            #torch.cuda.empty_cache()
-            
             with torch.no_grad():
                 (   
                     _,
@@ -243,11 +311,13 @@ class Trainer_class_aware_cont(UBTeacherTrainer):
                 # Unlabeled data
                 # Pseudo_labeling for ROI head (bbox location/objectness)
                 # gt_boxes, gt_classes, scores
+                
                 pseudo_proposals_roih_unsup_k, _ = self.process_pseudo_label(
                     proposals_roih_unsup_k, cur_threshold, "roih", "thresholding"
                 )
+                
                 joint_proposal_dict["proposals_pseudo_roih"] = pseudo_proposals_roih_unsup_k
-
+                
                 ###############################################
                 #            Get pseudo label info            #
                 ###############################################
@@ -259,13 +329,14 @@ class Trainer_class_aware_cont(UBTeacherTrainer):
                 # pseudo label과 실제 gt
                 # roi와 gt를 비교해보면 좋을것 같은데(classification threshold에 따라서 변화하는 정확도를 보면 좋을것)
                 
-                precisions, recalls, f1_scores, score_threshold = self.get_info_per_score_thereshold(gt_instances, proposals_roih_unsup_k)
-                for i, threshold in enumerate(score_threshold):
-                    self.storage.put_scalar(f"precision_{threshold}", precisions[i])
-                    self.storage.put_scalar(f"recall_{threshold}", recalls[i])
-                    self.storage.put_scalar(f"f1_score_{threshold}", f1_scores[i])
-
-                del gt_instances, precisions, recalls, f1_scores, score_threshold
+                # precisions, recalls, f1_scores, score_threshold = self.get_info_per_score_thereshold(gt_instances, proposals_roih_unsup_k)
+                
+                # for i, threshold in enumerate(score_threshold):
+                #     self.storage.put_scalar(f"precision_{threshold}", precisions[i])
+                #     self.storage.put_scalar(f"recall_{threshold}", recalls[i])
+                #     self.storage.put_scalar(f"f1_score_{threshold}", f1_scores[i])
+                
+                # del gt_instances, precisions, recalls, f1_scores, score_threshold
 
                 #  add pseudo-label to unlabeled data
                 unlabel_data_q = self.add_label(
@@ -274,279 +345,143 @@ class Trainer_class_aware_cont(UBTeacherTrainer):
                 unlabel_data_k = self.add_label(
                     unlabel_data_k, joint_proposal_dict["proposals_pseudo_roih"]
                 )
-
-                # target generate
-                # detections per image = 100
-                unlabel_data_strong_aug = unlabel_data_q + unlabel_data_q_2
-                
-                if self.target_generate_model == 'teacher':
-                    targets = self.generate_target_features(unlabel_data_strong_aug, self.model_teacher, proposals_roih_unsup_k)
-                elif self.target_generate_model == "student":
-                    if comm.get_world_size > 1:
-                        targets = self.generate_target_features(unlabel_data_strong_aug, self.model, proposals_roih_unsup_k)
+                if self.contrastive_learning == True:
+                    # target generate
+                    # detections per image = 100
+                    unlabel_data_strong_aug = unlabel_data_q + unlabel_data_q_2
+                    
+                    if self.target_generate_model == 'teacher':
+                        targets = self.generate_target_features(
+                            unlabel_data_strong_aug, 
+                            self.model_teacher, 
+                            proposals_roih_unsup_k, 
+                            box_jitter=self.box_jitter, 
+                            jitter_times=self.jitter_times, 
+                            jitter_frac=self.jitter_frac
+                        )
+                    elif self.target_generate_model == "student":
+                        raise NotImplementedError
+                        # if comm.get_world_size > 1:
+                        #     targets = self.generate_target_features(unlabel_data_strong_aug, self.model.module, proposals_roih_unsup_k, box_jitter=self.box_jitter)
+                        # else:
+                        #     targets = self.generate_target_features(unlabel_data_strong_aug, self.model, proposals_roih_unsup_k, box_jitter=self.box_jitter)
                     else:
-                        targets = self.generate_target_features(unlabel_data_strong_aug, self.model.module, proposals_roih_unsup_k)
-                else:
-                    raise NotImplementedError
+                        raise NotImplementedError
                 
-                del unlabel_data_strong_aug
+                    del unlabel_data_strong_aug
             #################################################################
-
+            # initialize
+            metrics_dict = {}
+            self.optimizer.zero_grad()
+            
             #############################
+            #                           #
+            #    supervised learning    #
+            #                           #
+            #############################
+            # prepare data 
+            all_label_data = label_data_q + label_data_k 
+            # supervised learning with label data
+            record_all_label_data, _, _, _ = self.model(
+                all_label_data, branch="supervised"
+            )
+
+            loss_dict = {}
+            for key in record_all_label_data.keys():
+                if key[:4] == "loss":
+                    if (key == "loss_box_reg_first_term") or (key =="loss_box_reg_second_term"):
+                        metrics_dict[key] = record_all_label_data[key].item()
+                    else:
+                        loss_dict[key] = record_all_label_data[key] * 1.0
+                        metrics_dict[key] = record_all_label_data[key].item()
+            label_loss = sum(loss_dict.values())
+            label_loss.backward()
+            del label_loss, record_all_label_data, label_data_q, label_data_k, all_label_data
+            # #############################
             #                           #
             #  unsupervised learning    #
             #                           #
             #############################
             # prepare data 
             # preparing image data
-            len_unlabel_data_q = len(unlabel_data_q)
-            
-            if comm.get_world_size() > 1:
-                record_all_unlabel_data, sources = self.unsup_forward(self.model.module, unlabel_data_q, unlabel_data_q_2, proposals_roih_unsup_k)
-                images_q = self.model.module.preprocess_image(unlabel_data_q)
-                images_q_2 = self.model.module.preprocess_image(unlabel_data_q_2)
-                gt_instances = [x["instances"].to(self.device) for x in unlabel_data_q]
-                # generate image features
-                features = self.model.module.backbone(torch.cat([images_q.tensor, images_q_2.tensor], dim=0))
-                features_q = {}
-                for key in features.keys():
-                    features_q[key] = features[key][:len_unlabel_data_q]
-                # generate proposals_rpn of unlabel_data_q
-                proposals_rpn, proposal_losses = self.model.module.proposal_generator(
-                    images_q, features_q, gt_instances
+            if self.contrastive_learning == True:
+                record_all_unlabel_data, _, _, _ = self.model(
+                    [unlabel_data_q, unlabel_data_q_2],
+                    branch="unsup_forward", 
+                    pseudo_label_reg=self.pseudo_label_reg,
+                    uncertainty_threshold=self.uncertainty_threshold,
+                    proposals_roih_unsup_k=proposals_roih_unsup_k,
+                    prediction=self.cont_prediction_head,
+                    box_jitter=self.box_jitter,
+                    jitter_times=self.jitter_times,
+                    jitter_frac=self.jitter_frac,
+                    class_aware_cont=self.class_aware_cont,
+                    cont_score_threshold=self.cont_score_threshold,
+                    cont_loss_type=self.cont_loss_type,
+                    temperature=self.temperature,
+                    targets=targets,
                 )
-                del images_q.tensor, images_q_2.tensor
-                proposals_rpn = self.model.module.roi_heads.label_and_sample_proposals(
-                    proposals_rpn, gt_instances
-                )
-                del gt_instances
-                features_q = [features_q[f] for f in self.box_in_features]
-                # detection loss of unlabel_data_q
-                box_features_q = self.model.module.roi_heads.box_pooler(features_q, [x.proposal_boxes for x in proposals_rpn])
-                box_features_q = self.model.module.roi_heads.box_head(box_features_q)
-                predictions = self.model.module.roi_heads.box_predictor(box_features_q)
-                detector_losses = self.model.module.roi_heads.box_predictor.losses(predictions, proposals_rpn)
-                record_all_unlabel_data.update(proposal_losses)
-                record_all_unlabel_data.update(detector_losses)
-                # compute cont loss
-                features = [features[f] for f in self.box_in_features]
-                sources = self.extract_projection_features(self.model.module, features, proposals_roih_unsup_k, prediction=self.cont_prediction_head, box_jitter=self.box_jitter)
-            
             else:
-                record_all_unlabel_data, sources = self.unsup_forward(self.model, unlabel_data_q, unlabel_data_q_2, proposals_roih_unsup_k)
-                images_q = self.model.preprocess_image(unlabel_data_q)
-                images_q_2 = self.model.preprocess_image(unlabel_data_q_2)
-                gt_instances = [x["instances"].to(self.device) for x in unlabel_data_q]
-                # generate image features
-                features = self.model.backbone(torch.cat([images_q.tensor, images_q_2.tensor], dim=0))
-                features_q = {}
-                for key in features.keys():
-                    features_q[key] = features[key][:len_unlabel_data_q]
-                # generate proposals_rpn of unlabel_data_q
-                proposals_rpn, proposal_losses = self.model.proposal_generator(
-                    images_q, features_q, gt_instances
+                record_all_unlabel_data, _, _, _ = self.model(
+                    unlabel_data_q,
+                    branch="supervised_smoothL1", 
+                    pseudo_label_reg=self.pseudo_label_reg,
+                    uncertainty_threshold=self.uncertainty_threshold,
                 )
-                del images_q.tensor, images_q_2.tensor
-                proposals_rpn = self.model.roi_heads.label_and_sample_proposals(
-                    proposals_rpn, gt_instances
-                )
-                del gt_instances
-                features_q = [features_q[f] for f in self.box_in_features]
-                # detection loss of unlabel_data_q
-                box_features_q = self.model.roi_heads.box_pooler(features_q, [x.proposal_boxes for x in proposals_rpn])
-                box_features_q = self.model.roi_heads.box_head(box_features_q)
-                predictions = self.model.roi_heads.box_predictor(box_features_q)
-                detector_losses = self.model.roi_heads.box_predictor.losses(predictions, proposals_rpn)
-                record_all_unlabel_data.update(proposal_losses)
-                record_all_unlabel_data.update(detector_losses)
-                # compute cont loss
-                features = [features[f] for f in self.box_in_features]
-                sources = self.extract_projection_features(self.model, features, proposals_roih_unsup_k, prediction=self.cont_prediction_head, box_jitter=self.box_jitter)
-
-            sym_cont_loss = self.get_sym_cont_loss(sources, targets, batch_size=len_unlabel_data_q)
-            record_all_unlabel_data.update({
-                'loss_cont': sym_cont_loss 
-            })
 
             new_record_all_unlabel_data = {}
             for key in record_all_unlabel_data.keys():
                 new_record_all_unlabel_data[key + "_pseudo"] = record_all_unlabel_data[key]
-              
+            
+            loss_dict = {}
             for key in new_record_all_unlabel_data.keys():
                 if key[:4] == "loss":
-                    if key == "loss_rpn_loc_pseudo" or key == "loss_box_reg_pseudo":
-                        metrics_dict[key] = new_record_all_unlabel_data[key].item()
-                        unlabel_loss += new_record_all_unlabel_data[key] * 0
-                    elif key[-6:] == "pseudo":
-                        # class-aware cont loss
-                        if key == "loss_cont_pseudo":
-                            metrics_dict[key] = new_record_all_unlabel_data[key].item()
-                            if self.contrastive_loss_weight_decay and (self.storage.iter > self.contrastive_loss_weight_decay_step):
-                                unlabel_loss += new_record_all_unlabel_data[key] * self.cfg.MOCO.CONTRASTIVE_LOSS_WEIGHT * 0.1
-                            else:
-                                unlabel_loss += new_record_all_unlabel_data[key] * self.cfg.MOCO.CONTRASTIVE_LOSS_WEIGHT
-                        # other unsup loss
+                    if key == "loss_rpn_loc_pseudo" or key == "loss_box_reg_pseudo": # Now, it is smoothL1 loss
+                        metrics_dict[key] = new_record_all_unlabel_data[key]
+                        if self.pseudo_label_reg == True:
+                            loss_dict[key] = new_record_all_unlabel_data[key] * self.cfg.SEMISUPNET.UNSUP_REG_LOSS_WEIGHT
                         else:
-                            metrics_dict[key] = new_record_all_unlabel_data[key].item()
-                            unlabel_loss += new_record_all_unlabel_data[key] * self.cfg.SEMISUPNET.UNSUP_LOSS_WEIGHT
+                            loss_dict[key] = new_record_all_unlabel_data[key] * 0.0
+                    elif (key == "loss_box_reg_first_term_pseudo") or (key =="loss_box_reg_second_term_pseudo"):
+                        metrics_dict[key] = new_record_all_unlabel_data[key]
+                    elif key == "loss_cont_pseudo":
+                        metrics_dict[key] = new_record_all_unlabel_data[key].item()
+                        if self.contrastive_loss_weight_decay and (self.storage.iter > self.contrastive_loss_weight_decay_step):
+                            loss_dict[key] = new_record_all_unlabel_data[key] * self.cfg.MOCO.CONTRASTIVE_LOSS_WEIGHT * 0.1
+                        else:
+                            loss_dict[key] = new_record_all_unlabel_data[key] * self.cfg.MOCO.CONTRASTIVE_LOSS_WEIGHT
+                    elif key[-6:] == "pseudo":
+                        metrics_dict[key] = new_record_all_unlabel_data[key].item()
+                        loss_dict[key] = new_record_all_unlabel_data[key] * self.cfg.SEMISUPNET.UNSUP_LOSS_WEIGHT
                     else:
                         raise NotImplementedError
-
+            
+            unlabel_loss = sum(loss_dict.values())
             unlabel_loss.backward()
-            del unlabel_loss, record_all_unlabel_data, new_record_all_unlabel_data
+            del unlabel_loss, loss_dict, record_all_unlabel_data, new_record_all_unlabel_data
 
             metrics_dict["data_time"] = data_time
             self._write_metrics(metrics_dict)
             self.optimizer.step()
 
-    def extract_projection_features(self, model, image_features, rois, prediction=False, box_jitter=False):
-        total_rois = rois + rois
+    @torch.no_grad()
+    def generate_target_features(self, data, model, proposals_roih_unsup_k, box_jitter=False, jitter_times=1, jitter_frac=0.06):
+        images = model.preprocess_image(data)
+        features = model.backbone(images.tensor)
         
-        # TODO: Remove bad prediction 0.1?
-        # i think lower than 0.1 has no important information
-        predicted_classes = [x.pred_classes[x.scores > 0.1] for x in total_rois]
-        predicted_boxes = [x.pred_boxes[x.scores > 0.1] for x in total_rois]
-        predicted_scores = [x.scores[x.scores > 0.1] for x in total_rois]
-
-        image_size = [x.image_size for x in total_rois]
-
-        assert len(image_size) == len(predicted_classes)
-        assert len(predicted_classes) == len(predicted_scores)
-        assert len(predicted_scores) == len(predicted_boxes)
-
-        if box_jitter == True:
-            predicted_boxes, predicted_classes, predicted_scores = self.box_jittering(predicted_boxes, predicted_classes, predicted_scores, image_size, times= self.jitter_times, frac=self.jitter_frac)
-
-        predicted_scores = torch.cat(predicted_scores, dim=0)
-        predicted_classes = torch.cat(predicted_classes, dim=0)
-                
-        box_features = model.roi_heads.box_pooler(image_features, predicted_boxes) # 7x7xC feature map
-        if self.feature_noise:
-            raise NotImplementedError
-        box_features = model.roi_heads.box_head(box_features)
-        box_features = model.roi_heads.box_projector(box_features)
-        if prediction:
-            box_features = model.roi_heads.feat_predictor(box_features)
+        features = [features[f] for f in self.box_in_features]
         
-        box_features = F.normalize(box_features, dim=1)
-        assert predicted_classes.shape[0] == predicted_scores.shape[0]
-        assert predicted_classes.shape[0] == box_features.shape[0]
+        targets = model.extract_projection_features(
+            features, \
+            proposals_roih_unsup_k, \
+            prediction=False,
+            box_jitter=box_jitter,
+            jitter_times=jitter_times,
+            jitter_frac=jitter_frac
+        )
+        del features, images.tensor, images
 
-        targets = {
-            'features': box_features,
-            'gt_classes': predicted_classes.detach(),
-            'gt_scores': predicted_scores.detach() 
-        }
         return targets
-
-    def get_sym_cont_loss(self, source, target, batch_size):
-        # from student 
-        source_features_q, source_features_q_2 = source['features'].chunk(2)
-        source_gt_classes_q, source_gt_classes_q_2 = source['gt_classes'].chunk(2)
-        source_gt_scores = source['gt_scores']
-        source_gt_scores[(source_gt_scores < self.cont_score_threshold)] = 0.0
-        source_gt_scores_q, source_gt_scores_q_2 = source_gt_scores.chunk(2)
-
-        # from teacher 
-        with torch.no_grad():
-            target_features_q = torch.zeros(100 * batch_size, 128).to(self.device)
-            target_features_q_2 = torch.zeros(100 * batch_size, 128).to(self.device)
-
-            target_gt_classes_q = torch.zeros(100 * batch_size).to(self.device).fill_(-1.0)
-            target_gt_classes_q_2 = torch.zeros(100 * batch_size).to(self.device).fill_(-1.0)
-            
-            target_gt_scores_q = torch.zeros(100 * batch_size).to(self.device)
-            target_gt_scores_q_2 = torch.zeros(100 * batch_size).to(self.device)
-
-            num_of_targets = int(target['features'].shape[0] / 2)
-            target_features_q[:num_of_targets], target_features_q_2[:num_of_targets] = target['features'].chunk(2) # (N,128)
-            target_gt_classes_q[:num_of_targets], target_gt_classes_q_2[:num_of_targets] = target['gt_classes'].chunk(2) # (N)
-            target_gt_scores = target['gt_scores']
-            target_gt_scores[(target_gt_scores <self.cont_score_threshold)] = 0.0
-            target_gt_scores_q[:num_of_targets], target_gt_scores_q_2[:num_of_targets] = target_gt_scores.chunk(2) #(N)
-
-            target_features_q_2 = concat_all_gather(target_features_q_2)
-            target_gt_classes_q_2 = concat_all_gather(target_gt_classes_q_2)
-            target_gt_scores_q_2 = concat_all_gather(target_gt_scores_q_2)
-
-            valid = (target_gt_classes_q_2 != -1.0)
-            target_features_q_2 = target_features_q_2[valid]
-            target_gt_classes_q_2 = target_gt_classes_q_2[valid]
-            target_gt_scores_q_2 = target_gt_scores_q_2[valid]
-
-        if self.cont_loss_type == 'infoNCE':
-            loss_first = self.cont_loss(source_features_q, source_gt_classes_q, source_gt_scores_q, target_features_q_2, target_gt_classes_q_2, target_gt_scores_q_2)
-        elif self.cont_loss_type == 'byol':
-            loss_first = self.byol_loss(source_features_q, source_gt_classes_q, source_gt_scores_q, target_features_q_2, target_gt_classes_q_2, target_gt_scores_q_2)
-        else:
-            raise NotImplementedError
-
-        del source_features_q, source_gt_classes_q, source_gt_scores_q, target_features_q_2, target_gt_classes_q_2, target_gt_scores_q_2
-
-        with torch.no_grad():
-            target_features_q = concat_all_gather(target_features_q)
-            target_gt_classes_q = concat_all_gather(target_gt_classes_q)
-            target_gt_scores_q = concat_all_gather(target_gt_scores_q)
-
-            valid = (target_gt_classes_q != -1.0)
-            target_features_q = target_features_q[valid]
-            target_gt_classes_q = target_gt_classes_q[valid]
-            target_gt_scores_q = target_gt_scores_q[valid]
-
-        if self.cont_loss_type == 'infoNCE':
-            loss_second = self.cont_loss(source_features_q_2, source_gt_classes_q_2, source_gt_scores_q_2, target_features_q, target_gt_classes_q, target_gt_scores_q)
-        elif self.cont_loss_type == 'byol':
-            loss_second = self.byol_loss(source_features_q_2, source_gt_classes_q_2, source_gt_scores_q_2, target_features_q, target_gt_classes_q, target_gt_scores_q)
-        else:
-            raise NotImplementedError
-
-        del source_features_q_2, source_gt_classes_q_2, source_gt_scores_q_2, target_features_q, target_gt_classes_q, target_gt_scores_q
-
-        loss = 0.5 * (loss_first + loss_second) # symmetric loss function
-
-        return loss.mean()
-    # if train model with multi gpus, matrix is not NxN
-    def cont_loss(self, source_features, source_gt_classes, source_gt_scores, target_features, target_gt_classes, target_gt_scores):
-        
-        self_mask = torch.zeros(source_features.shape[0], target_features.shape[0]).float().fill_diagonal_(1.0).to(self.device)
-        
-        class_match_mask = torch.eq(source_gt_classes.view(-1,1), target_gt_classes.view(1,-1)).float()
-
-        score_weight = torch.mm(source_gt_scores.view(-1,1), target_gt_scores.view(1,-1))
-
-        weighted_matched_mask = (score_weight * class_match_mask).fill_diagonal_(1.0)
-        #weighted_matched_mask = (score_weight * class_match_mask).fill_diagonal_(1.0)
-
-        cos_sim = torch.mm(source_features, target_features.T.detach())
-        del target_features, target_gt_classes, target_gt_scores 
-        cos_sim /= self.temperature
-
-        logits_row_max, _ = torch.max(cos_sim, dim=1, keepdim=True)
-        cos_sim = cos_sim - logits_row_max.detach()
-
-        log_prob = cos_sim - torch.log((torch.exp(cos_sim)*(1.0-self_mask)).sum(dim=1, keepdim=True))
-        
-        loss = -(log_prob * weighted_matched_mask).sum(dim=1) / torch.count_nonzero(weighted_matched_mask,dim=1)
-
-        return loss.mean()
-
-    # L = 2 - 2 * || z_i * z_j || 
-    # cont_loss에서 같은 클래스 이미지인데 negative로 학습될수있는 문제가 있다(score가 낮아서 classwise positive pair가 되지 않은 녀석들)
-    # class aware byol loss를 적용하면 negative pair가 적용되지 않기때문에 이런 negative한 경우가 발생하지 않을 것이다. 
-    def byol_loss(self, source_features, source_gt_classes, source_gt_scores, target_features, target_gt_classes, target_gt_scores):
-        self_mask = torch.zeros(source_features.shape[0], source_features.shape[0]).float().fill_diagonal_(1.0).cuda()
-        
-        class_match_mask = torch.eq(source_gt_classes.view(-1,1), target_gt_classes.view(1,-1)).float()
-
-        score_weight = torch.mm(source_gt_scores.view(-1,1), target_gt_scores.view(1,-1))
-
-        weighted_matched_mask = (score_weight * class_match_mask).fill_diagonal_(1.0)
-
-        cos_sim = torch.mm(source_features, target_features.T.detach())
-        
-        loss =  - 2 * (cos_sim * weighted_matched_mask).sum(dim=1) / torch.count_nonzero(weighted_matched_mask, dim=1)
-
-        return loss.mean()
 
     def get_info_per_score_thereshold(self, gt_instances, rois, iou_threshold=0.5):
         '''
@@ -595,120 +530,3 @@ class Trainer_class_aware_cont(UBTeacherTrainer):
         recalls = matched_gt / (total_gt_num + 1e-6)
         f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-6)
         return precisions, recalls, f1_scores, score_threshold
-
-    # From soft teacher 
-    # https://github.com/microsoft/SoftTeacher/blob/main/configs/soft_teacher/base.py
-    def box_jittering(self, boxes, boxes_class, boxes_score, images_size, times=4, frac=0.06):
-        def _aug_single(box, image_size): # image_size (height, width)
-            # random translate and resizing
-
-            box_scale = box.tensor[:, 2:4] - box.tensor[:, :2]
-            box_scale = (
-                box_scale.clamp(min=1)[:, None, :].expand(-1, 2, 2).reshape(-1, 4)
-            )
-            aug_scale = box_scale * frac  # [n,4]
-
-            offset = (
-                torch.randn(times, box.tensor.shape[0], 4, device=box.tensor.device) # normal distribution N(0,1)
-                * aug_scale[None, ...]
-            )
-            new_box = box.tensor.clone()[None, ...].expand(times, box.tensor.shape[0], -1)
-            new_box = new_box[:,:,:4] + offset
-
-            # (x1,y1,x2,y2)
-            new_box[:,:,0] = new_box[:,:,0].clamp(min=0.0)
-            new_box[:,:,1] = new_box[:,:,1].clamp(min=0.0)
-
-            new_box[:,:,2] = new_box[:,:,2].clamp(max=image_size[1]) # image width
-            new_box[:,:,3] = new_box[:,:,3].clamp(max=image_size[0]) # image height
-
-            return Boxes(new_box.reshape(-1,4))
-
-        def _aug_single_class(box_class):
-            new_class = box_class.clone()[None, ...].expand(times, box_class.shape[0]).reshape(-1)
-            return new_class 
-
-        def _aug_single_score(box_score):
-            new_score = box_score.clone()[None, ...].expand(times, box_score.shape[0]).reshape(-1)
-            return new_score
-
-        jittered_boxes = [_aug_single(box, image_size) for box, image_size in zip(boxes,images_size)]
-        jittered_classes = [_aug_single_class(box_class) for box_class in boxes_class]
-        jittered_scores = [_aug_single_score(box_score) for box_score in boxes_score]
-
-        return jittered_boxes, jittered_classes, jittered_scores
-
-    @torch.no_grad()
-    def generate_target_features(self, data, model, proposals_roih_unsup_k):
-        images = model.preprocess_image(data)
-        features = model.backbone(images.tensor)
-        
-        features = [features[f] for f in self.box_in_features]
-        
-        targets = self.extract_projection_features(
-            model, \
-            features, \
-            proposals_roih_unsup_k, \
-            prediction=False,
-            box_jitter=self.box_jitter
-        )
-        del features, images.tensor, data
-
-        return targets
-
-    def unsup_forward(self, model, unlabel_data_q, unlabel_data_q_2, proposals_roih_unsup_k):
-        record_all_unlabel_data = {}
-        len_unlabel_data_q = len(unlabel_data_q)
-
-        images_q = model.preprocess_image(unlabel_data_q)
-        images_q_2 = model.preprocess_image(unlabel_data_q_2)
-        gt_instances = [x["instances"].to(self.device) for x in unlabel_data_q]
-        # generate image features
-        # unlabel_data_q -> proposal_losses and detector_losses
-        # unlabel_data_q, unlabel_data_q_2 -> cont loss 
-        features = model.backbone(torch.cat([images_q.tensor, images_q_2.tensor], dim=0))
-        features_q = {}
-        for key in features.keys():
-            features_q[key] = features[key][:len_unlabel_data_q]
-        # generate proposals_rpn of unlabel_data_q
-        proposals_rpn, proposal_losses = model.proposal_generator(
-            images_q, features_q, gt_instances
-        )
-        del images_q.tensor, images_q_2.tensor
-        # sampling for roi training
-        proposals_rpn = model.roi_heads.label_and_sample_proposals(
-            proposals_rpn, gt_instances
-        )
-        del gt_instances
-        features_q = [features_q[f] for f in self.box_in_features]
-        # detection loss of unlabel_data_q
-        box_features_q = model.roi_heads.box_pooler(features_q, [x.proposal_boxes for x in proposals_rpn])
-        box_features_q = model.roi_heads.box_head(box_features_q)
-        predictions = model.roi_heads.box_predictor(box_features_q)
-        detector_losses = model.roi_heads.box_predictor.losses(predictions, proposals_rpn)
-        record_all_unlabel_data.update(proposal_losses)
-        record_all_unlabel_data.update(detector_losses)
-        # compute cont loss
-        features = [features[f] for f in self.box_in_features]
-        sources = self.extract_projection_features(model, features, proposals_roih_unsup_k, prediction=self.cont_prediction_head, box_jitter=self.box_jitter)
-        
-        return record_all_unlabel_data, sources
-        
-@torch.no_grad()
-def concat_all_gather(tensor):
-    # batch_size * 100
-    """
-    Performs all_gather operation on the provided tensors.
-    *** Warning ***: torch.distributed.all_gather has no gradient.
-    """
-    tensors_gather = [torch.ones_like(tensor)
-        for _ in range(torch.distributed.get_world_size())]
-    torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
-
-    rank = torch.distributed.get_rank()
-    # first block is related to corrent rank
-    tensors_gather[0], tensors_gather[rank] = tensors_gather[rank], tensors_gather[0]
-
-    output = torch.cat(tensors_gather, dim=0)
-    return output
-

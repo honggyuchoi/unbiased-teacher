@@ -1,4 +1,16 @@
-CUDA_VISIBLE_DEVICES=3 python train_net.py \
---config-file configs/plain_faster_rcnn/coco_supervision/faster_rcnn_R_50_FPN_sup1_run1.yaml \
---eval-only MODEL.WEIGHTS weights/coco_1.0_x3.pkl \
-OUTPUT_DIR './output/coco_100.0/ubteacher_weights_x3';
+#configs/plain_faster_rcnn/voc/voc07_voc12.yaml
+#
+
+CUDA_VISIBLE_DEVICES=2,3 python train_net.py \
+--config-file configs/class_aware_cont/voc/voc07_voc12.yaml \
+--eval-only \
+MODEL.WEIGHTS 'output/ablation_study/voc_07_12coco20_ours/model_0073999.pth' \
+TEST.EVALUATOR 'voc' \
+MODEL.ROI_BOX_HEAD.BOX_ENCODE_TYPE "xyxy" \
+OUTPUT_DIR 'eval/';
+
+# output/ablation_study/voc_07_12coco20_ours/model_0065999.pth
+# output/ablation_study/voc_07_12coco20_ours/model_0067999.pth
+# output/ablation_study/voc_07_12coco20_ours/model_0069999.pth
+# output/ablation_study/voc_07_12coco20_ours/model_0071999.pth
+# output/ablation_study/voc_07_12coco20_ours/model_0073999.pth

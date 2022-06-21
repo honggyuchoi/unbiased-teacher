@@ -1,6 +1,6 @@
 _BASE_: "../Base-RCNN-FPN.yaml"
 MODEL:
-  META_ARCHITECTURE: "TwoStagePseudoLabGeneralizedRCNN_MoCo"
+  META_ARCHITECTURE: "TwoStagePseudoLabGeneralizedRCNN_MoCov1"
   WEIGHTS: "detectron2://ImageNetPretrained/MSRA/R-50.pkl"
   MASK_ON: False
   RESNETS:
@@ -11,7 +11,7 @@ MODEL:
     POSITIVE_FRACTION: 0.25 # detectron2 default is 0.5
     LOSS: "CrossEntropy"
   ROI_HEADS:
-    NAME: "MoCov2ROIHeadsPseudoLab"
+    NAME: "MoCov1ROIHeadsPseudoLab"
     LOSS: "FocalLoss" # ubteacher defaults is focal loss 
 SOLVER:
   LR_SCHEDULER_NAME: "WarmupMultiStepLR"
@@ -28,15 +28,15 @@ DATASETS:
   TRAIN: ("coco_2017_train",)
   TEST: ("coco_2017_val",)
 SEMISUPNET:
-  Trainer: "mocov2"
+  Trainer: "mocov1"
   BBOX_THRESHOLD: 0.7 # for pseudo label
   TEACHER_UPDATE_ITER: 1
   BURN_UP_STEP: 2000
-  EMA_KEEP_RATE: 0.9996
+  EMA_KEEP_RATE: 0.999 # 0.9996
   UNSUP_LOSS_WEIGHT: 2.0
 TEST:
   EVAL_PERIOD: 1000
-OUTPUT_DIR: './output/coco_1.0/mocov2_trial_1'
+OUTPUT_DIR: './output/coco_1.0/mocov1_trial_1'
 MOCO:
   QUEUE_SIZE: 50000
   CONTRASTIVE_FEATURE_DIM: 128

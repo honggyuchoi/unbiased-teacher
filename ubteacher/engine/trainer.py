@@ -30,8 +30,12 @@ from ubteacher.data.build import (
     build_detection_semisup_train_loader,
     build_detection_test_loader,
     build_detection_semisup_train_loader_two_crops,
+    build_detection_semisup_train_loader_three_crops
 )
-from ubteacher.data.dataset_mapper import DatasetMapperTwoCropSeparate
+from ubteacher.data.dataset_mapper import (
+    DatasetMapperTwoCropSeparate,
+    DatasetMapperThreeCropSeparate
+)
 from ubteacher.engine.hooks import LossEvalHook, BestCheckpointer
 from ubteacher.modeling.meta_arch.ts_ensemble import EnsembleTSModel
 from ubteacher.checkpoint.detection_checkpoint import DetectionTSCheckpointer
@@ -54,7 +58,8 @@ class BaselineTrainer(DefaultTrainer):
 
         if comm.get_world_size() > 1:
             model = DistributedDataParallel(
-                model, device_ids=[comm.get_local_rank()], broadcast_buffers=False
+                model, device_ids=[comm.get_local_rank()], broadcast_buffers=False,
+                find_unused_parameters=True
             )
 
         TrainerBase.__init__(self)
@@ -144,7 +149,9 @@ class BaselineTrainer(DefaultTrainer):
 
         loss_dict = {}
         for key in record_dict.keys():
-            if key[:4] == "loss" and key[-3:] != "val":
+            if key == "loss_box_reg_first_term" or key == "loss_box_reg_second_term":
+                pass
+            elif key[:4] == "loss" and key[-3:] != "val":
                 loss_dict[key] = record_dict[key]
 
         losses = sum(loss_dict.values())
@@ -164,7 +171,7 @@ class BaselineTrainer(DefaultTrainer):
         evaluator_list = []
         evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
 
-        if evaluator_type == "coco":
+        if evaluator_type == "coco" or evaluator_type == "COCOeval":
             evaluator_list.append(COCOEvaluator(
                 dataset_name, output_dir=output_folder))
         elif evaluator_type == "pascal_voc":
@@ -327,6 +334,12 @@ class UBTeacherTrainer(DefaultTrainer):
         self.cfg = cfg
 
         self.register_hooks(self.build_hooks())
+        self.warmup_ema = cfg.MOCO.WARMUP_EMA
+
+    @property
+    def device(self):
+        return self.model.device
+
 
     def resume_or_load(self, resume=True):
         """
@@ -347,6 +360,10 @@ class UBTeacherTrainer(DefaultTrainer):
             self.start_iter = checkpoint.get("iteration", -1) + 1
             # The checkpoint stores the training iteration that just finished, thus we start
             # at the next iteration (or iter zero if there's no checkpoint).
+        if self.cfg.MODEL.WEIGHTS and self.cfg.MOCO.RESUME_AFTER_BURNUP:
+            self.start_iter = checkpoint['scheduler'].get('last_epoch', -1) + 1
+            checkpoint = self.checkpointer._load_optimizer_scheduler(checkpoint)
+            # self.ensem_ts_model._init_queue(self.cfg, self.classwise_queue)
         if isinstance(self.model, DistributedDataParallel):
             # broadcast loaded data/model from the first rank, because other
             # machines may not have access to the checkpoint file
@@ -361,7 +378,7 @@ class UBTeacherTrainer(DefaultTrainer):
         evaluator_list = []
         evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
         
-        if cfg.TEST.EVALUATOR == "coco":
+        if (cfg.TEST.EVALUATOR == "coco") or (cfg.TEST.EVALUATOR == "COCOeval"):
             evaluator_list.append(COCOEvaluator(
                 dataset_name, output_dir=output_folder))
             return evaluator_list[0]
@@ -385,9 +402,14 @@ class UBTeacherTrainer(DefaultTrainer):
         return DatasetEvaluators(evaluator_list)
 
     @classmethod
-    def build_train_loader(cls, cfg):
-        mapper = DatasetMapperTwoCropSeparate(cfg, True)
-        return build_detection_semisup_train_loader_two_crops(cfg, mapper)
+    def build_train_loader(cls, cfg, two_strong_aug_unlabel=False):
+        if two_strong_aug_unlabel == True:
+            label_mapper = DatasetMapperTwoCropSeparate(cfg, True) 
+            unlabel_mapper = DatasetMapperThreeCropSeparate(cfg, True)
+            return build_detection_semisup_train_loader_three_crops(cfg, label_mapper=label_mapper, unlabel_mapper=unlabel_mapper)
+        else:
+            mapper = DatasetMapperTwoCropSeparate(cfg, True)
+            return build_detection_semisup_train_loader_two_crops(cfg, mapper)
 
     @classmethod
     def build_lr_scheduler(cls, cfg, optimizer):
@@ -413,6 +435,10 @@ class UBTeacherTrainer(DefaultTrainer):
                 for self.iter in range(start_iter, max_iter):
                     self.before_step()
                     self.run_step_full_semisup()
+                    # save model end of burnup stage
+                    if self.iter + 1 == self.cfg.SEMISUPNET.BURN_UP_STEP \
+                        and comm.is_main_process():
+                        self.checkpointer.save('model_burnup')
                     self.after_step()
             except Exception:
                 logger.exception("Exception during training:")
@@ -425,7 +451,11 @@ class UBTeacherTrainer(DefaultTrainer):
     # =====================================================
     def threshold_bbox(self, proposal_bbox_inst, thres=0.7, proposal_type="roih"):
         if proposal_type == "rpn":
-            valid_map = proposal_bbox_inst.objectness_logits > thres
+            #valid_map = proposal_bbox_inst.objectness_logits > thres
+
+            # objectness_logits is not score!!
+            objectness_scores = torch.sigmoid(proposal_bbox_inst.objectness_logits)
+            valid_map = (objectness_scores > thres)
 
             # create instances containing boxes and gt_classes
             image_shape = proposal_bbox_inst.image_size
@@ -525,11 +555,12 @@ class UBTeacherTrainer(DefaultTrainer):
                 # update copy the the whole model
                 self._update_teacher_model(keep_rate=0.00)
 
-            elif (
-                self.iter - self.cfg.SEMISUPNET.BURN_UP_STEP
-            ) % self.cfg.SEMISUPNET.TEACHER_UPDATE_ITER == 0:
-                self._update_teacher_model(
-                    keep_rate=self.cfg.SEMISUPNET.EMA_KEEP_RATE)
+            elif (self.iter - self.cfg.SEMISUPNET.BURN_UP_STEP) % self.cfg.SEMISUPNET.TEACHER_UPDATE_ITER == 0:
+                alpha = self.cfg.SEMISUPNET.EMA_KEEP_RATE # 0.9996
+                if self.warmup_ema:
+                    global_step = self.iter - self.cfg.SEMISUPNET.BURN_UP_STEP
+                    alpha = min(1 - 1 / (global_step + 1), alpha) 
+                self._update_teacher_model(keep_rate=alpha)
 
             record_dict = {}
             #  generate the pseudo-label using teacher model
@@ -742,16 +773,93 @@ class UBTeacherTrainer(DefaultTrainer):
         ret.append(hooks.EvalHook(cfg.TEST.EVAL_PERIOD,
                    test_and_save_results_teacher))
 
+        if cfg.TEST.VAL_LOSS:  # default is True # save training time if not applied
+            ret.append(
+                LossEvalHook(
+                    cfg.TEST.VAL_LOSS_PERIOD,
+                    self.model,
+                    build_detection_test_loader(
+                        self.cfg,
+                        self.cfg.DATASETS.TEST[0],
+                        DatasetMapper(self.cfg, True),
+                    ),
+                    model_output="loss_proposal",
+                    model_name="_student",
+                )
+            )
+
+            ret.append(
+                LossEvalHook(
+                    cfg.TEST.VAL_LOSS_PERIOD,
+                    self.model_teacher,
+                    build_detection_test_loader(
+                        self.cfg,
+                        self.cfg.DATASETS.TEST[0],
+                        DatasetMapper(self.cfg, True),
+                    ),
+                    model_output="loss_proposal",
+                    model_name="",
+                    ignore_burnupstep = True
+                )
+            )
         if comm.is_main_process():
             # run writers in the end, so that evaluation metrics are written
             ret.append(hooks.PeriodicWriter(self.build_writers(), period=20))
-            ret.append(
-                BestCheckpointer(
-                    cfg.TEST.EVAL_PERIOD, 
-                    self.checkpointer, 
-                    'bbox/AP', 
-                    'max', 
-                    'model_best'
-                )
-            )
+            # ret.append(
+            #     BestCheckpointer(
+            #         cfg.TEST.EVAL_PERIOD, 
+            #         self.checkpointer, 
+            #         'bbox/AP', 
+            #         'max', 
+            #         'model_best'
+            #     )
+            # )
         return ret
+
+    def get_info_per_score_thereshold(self, gt_instances, rois, iou_threshold=0.5):
+        '''
+            score_threshold 0.6, 0.7, 0.8, 0.9
+            precisions, recalls, f1_scores, score_threshold
+        '''
+        score_threshold = [0.6, 0.7, 0.8, 0.9]
+        total_prediction_num = torch.zeros(4).float().to(self.device)
+        total_gt_num = 0.0
+        
+        matched_predictions = torch.zeros(4).float().to(self.device)
+        matched_gt = torch.zeros(4).float().to(self.device)
+        precisions = torch.zeros(4).float().to(self.device)
+        recalls = torch.zeros(4).float().to(self.device)
+        f1_scores = torch.zeros(4).float().to(self.device)
+        
+        for predictions_per_image, targets_per_image in zip(rois, gt_instances):
+            if len(targets_per_image) == 0:
+                continue
+            pred_boxes = predictions_per_image.pred_boxes
+            pred_classes = predictions_per_image.pred_classes
+
+            gt_boxes = targets_per_image.gt_boxes
+            gt_classes = targets_per_image.gt_classes
+            total_gt_num += len(targets_per_image)
+
+            matched_quality_matrix = pairwise_iou(gt_boxes, pred_boxes)
+            class_match_matrix = torch.eq(gt_classes.view(-1,1), pred_classes.view(1,-1))
+
+            matched_quality_matrix = matched_quality_matrix * class_match_matrix
+            matched_vals, matched_idx = matched_quality_matrix.max(dim=0)
+
+            valid_iou_map = (matched_vals > iou_threshold)
+
+            for i in range(4):
+                # total thresholded number
+                valid_score_map = (predictions_per_image.scores > score_threshold[i])
+                total_prediction_num[i] += pred_classes[valid_score_map].numel()
+
+                valid_map = (valid_score_map & valid_iou_map)
+                
+                matched_predictions[i] += valid_map.sum()
+                matched_gt[i] += torch.unique(matched_idx[valid_map]).numel()
+
+        precisions = matched_predictions / (total_prediction_num + 1e-6) 
+        recalls = matched_gt / (total_gt_num + 1e-6)
+        f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-6)
+        return precisions, recalls, f1_scores, score_threshold

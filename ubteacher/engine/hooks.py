@@ -12,12 +12,13 @@ from fvcore.common.checkpoint import Checkpointer
 
 
 class LossEvalHook(HookBase):
-    def __init__(self, eval_period, model, data_loader, model_output, model_name=""):
+    def __init__(self, eval_period, model, data_loader, model_output, model_name="", ignore_burnupstep=False):
         self._model = model
         self._period = eval_period
         self._data_loader = data_loader
         self._model_output = model_output
         self._model_name = model_name
+        self._ignore_burnupstep = ignore_burnupstep
 
     def _do_loss_eval(self):
         record_acc_dict = {}
@@ -46,7 +47,7 @@ class LossEvalHook(HookBase):
             if comm.is_main_process():
                 total_losses_reduced = sum(loss for loss in loss_acc_dict.values())
                 self.trainer.storage.put_scalar(
-                    "val_total_loss_val" + self._model_name, total_losses_reduced
+                    "val_total_loss_val" + self._model_name, total_losses_reduced, smoothing_hint=False
                 )
 
                 record_acc_dict = {
@@ -55,7 +56,7 @@ class LossEvalHook(HookBase):
                 }
 
                 if len(record_acc_dict) > 1:
-                    self.trainer.storage.put_scalars(**record_acc_dict)
+                    self.trainer.storage.put_scalars(**record_acc_dict, smoothing_hint=False)
 
     def _get_loss(self, data, model):
         if self._model_output == "loss_only":
@@ -89,7 +90,7 @@ class LossEvalHook(HookBase):
             }
             total_losses_reduced = sum(loss for loss in metrics_dict.values())
 
-            self.trainer.storage.put_scalar("val_total_loss_val", total_losses_reduced)
+            self.trainer.storage.put_scalar("val_total_loss_val", total_losses_reduced, smoothing_hint=False)
             if len(metrics_dict) > 1:
                 self.trainer.storage.put_scalars(**metrics_dict)
 
@@ -105,7 +106,11 @@ class LossEvalHook(HookBase):
         next_iter = self.trainer.iter + 1
         is_final = next_iter == self.trainer.max_iter
         if is_final or (self._period > 0 and next_iter % self._period == 0):
-            self._do_loss_eval()
+            if self._ignore_burnupstep and (self.trainer.iter > self.trainer.cfg.SEMISUPNET.BURN_UP_STEP):
+                self._do_loss_eval()
+
+            elif self._ignore_burnupstep is False:
+                self._do_loss_eval()
 
 # save best performance model
 class BestCheckpointer(HookBase):
