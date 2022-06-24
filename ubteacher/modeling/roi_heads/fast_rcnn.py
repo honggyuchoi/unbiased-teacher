@@ -451,8 +451,6 @@ class FastRCNNUncertaintyOutputLayers(FastRCNNOutputLayers):
         box_dim = proposal_boxes.shape[1]  # 4 or 5
         # Regression loss is only computed for foreground proposals (those matched to a GT)
         fg_inds = nonzero_tuple((gt_classes >= 0) & (gt_classes < self.num_classes))[0]
-        if fg_inds.numel() == 0:
-            return 0, 0, 0
         
         if pred_deltas.shape[1] == box_dim:  # cls-agnostic regression
             fg_pred_deltas = pred_deltas[fg_inds]
@@ -482,6 +480,8 @@ class FastRCNNUncertaintyOutputLayers(FastRCNNOutputLayers):
                 fg_mask=...,
                 beta=beta, 
             )
+            var_loss = fg_pred_deltas_variance.sum() * 0
+            loss = loss + var_loss 
             return loss / normalizer, loss.detach() / normalizer, 0
        
         elif (branch == "supervised") or (branch=="val_loss_with_uncertainty"):

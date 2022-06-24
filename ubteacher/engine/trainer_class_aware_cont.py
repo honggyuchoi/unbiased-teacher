@@ -63,6 +63,7 @@ class Trainer_class_aware_cont(UBTeacherTrainer):
         # create an teacher model
         model_teacher = self.build_model(cfg)
         self.model_teacher = model_teacher
+        
         del self.model_teacher.roi_heads.feat_predictor
 
         # For training, wrap with DDP. But don't need this for inference.
@@ -304,6 +305,16 @@ class Trainer_class_aware_cont(UBTeacherTrainer):
                     proposals_roih_unsup_k,
                     _,
                 ) = self.model_teacher(unlabel_data_k, branch="unsup_data_weak")
+                
+                # Generate preditions and contrastive targets(GPU can handle?) 
+                # (   
+                #     _,
+                #     proposals_rpn_unsup_k,
+                #     proposals_roih_unsup_k,
+                #     _,
+                #     targets 
+                # ) = self.model_teacher(unlabel_data_k, branch="predictions_with_cont")
+
                 # Need to generate target proposal features
                 joint_proposal_dict = {}
                 #  Pseudo-labeling
@@ -386,17 +397,17 @@ class Trainer_class_aware_cont(UBTeacherTrainer):
                 all_label_data, branch="supervised"
             )
 
-            loss_dict = {}
+            label_loss_dict = {}
             for key in record_all_label_data.keys():
                 if key[:4] == "loss":
                     if (key == "loss_box_reg_first_term") or (key =="loss_box_reg_second_term"):
                         metrics_dict[key] = record_all_label_data[key].item()
                     else:
-                        loss_dict[key] = record_all_label_data[key] * 1.0
+                        label_loss_dict[key] = record_all_label_data[key] * 1.0
                         metrics_dict[key] = record_all_label_data[key].item()
-            label_loss = sum(loss_dict.values())
-            label_loss.backward()
-            del label_loss, record_all_label_data, label_data_q, label_data_k, all_label_data
+            label_loss = sum(label_loss_dict.values())
+            #label_loss.backward()
+            #del label_loss, record_all_label_data, label_data_q, label_data_k, all_label_data
             # #############################
             #                           #
             #  unsupervised learning    #
@@ -457,7 +468,8 @@ class Trainer_class_aware_cont(UBTeacherTrainer):
                         raise NotImplementedError
             
             unlabel_loss = sum(loss_dict.values())
-            unlabel_loss.backward()
+            losses = unlabel_loss + label_loss
+            losses.backward()
             del unlabel_loss, loss_dict, record_all_unlabel_data, new_record_all_unlabel_data
 
             metrics_dict["data_time"] = data_time

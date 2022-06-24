@@ -316,6 +316,7 @@ def build_semisup_batch_data_loader_three_crop(
             sampler=label_sampler,
             num_workers=num_workers,
             batch_sampler=None,
+            pin_memory = True,
             collate_fn=operator.itemgetter(
                 0
             ),  # don't batch, but yield individual elements
@@ -326,6 +327,7 @@ def build_semisup_batch_data_loader_three_crop(
             sampler=unlabel_sampler,
             num_workers=num_workers,
             batch_sampler=None,
+            pin_memory = True,
             collate_fn=operator.itemgetter(
                 0
             ),  # don't batch, but yield individual elements

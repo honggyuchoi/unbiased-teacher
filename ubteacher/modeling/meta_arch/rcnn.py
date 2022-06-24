@@ -557,7 +557,8 @@ class TwoStagePseudoLabGeneralizedRCNN_cont(GeneralizedRCNN):
         if (not self.training) and (not val_mode):
             return self.inference(batched_inputs)
         
-        if branch == 'unsup_forward':
+        # memory to gpu and backbone operation
+        if (branch == 'unsup_forward') or (branch == 'predictions_with_cont'):
             pass
         else:
             images = self.preprocess_image(batched_inputs)
@@ -566,6 +567,8 @@ class TwoStagePseudoLabGeneralizedRCNN_cont(GeneralizedRCNN):
             else:
                 gt_instances = None
             features = self.backbone(images.tensor)
+
+        ##################################################################################
 
         if (branch == "supervised") or (branch=="supervised_smoothL1"):
             # Region proposal network
@@ -580,9 +583,15 @@ class TwoStagePseudoLabGeneralizedRCNN_cont(GeneralizedRCNN):
                 pseudo_label_reg=pseudo_label_reg,
                 uncertainty_threshold=uncertainty_threshold
             )
+
+            # To set unused_parameter = False
+            temp = torch.rand((0,1024),device='cuda:0', requires_grad=True)
+            temp_loss = self.roi_heads.feat_predictor(self.roi_heads.box_projector(temp)).sum()
+
             losses = {}
             losses.update(detector_losses)
             losses.update(proposal_losses)
+            losses['loss_temp'] = temp_loss
             return losses, [], [], None
 
         # generate pseudo label candidate
@@ -639,6 +648,43 @@ class TwoStagePseudoLabGeneralizedRCNN_cont(GeneralizedRCNN):
             losses.update(detector_losses)
             losses.update(proposal_losses)
             return losses, pred_instances, [], None
+
+        elif branch == "predictions_with_cont":
+            unlabeled_data_k, unlabeled_data_q, unlabeled_data_q2 = batched_inputs
+            batch_size = len(unlabeled_data_k)
+            images_k = self.preprocess_image(unlabeled_data_k)
+            images_q = self.preprocess_image(unlabeled_data_q)
+            images_q2 = self.preprocess_image(unlabeled_data_q2)
+
+            features = self.backbone(torch.cat([images_k.tensor, images_q.tensor, images_q2.tensor], dim=0))
+            del images_q, images_q2
+            features_k = {}
+            features_q_all = {}
+
+            for key in features.keys():
+                features_k[key], features_q_all[key] = features[key].split([batch_size, batch_size * 2])
+
+            proposals_rpn, _ = self.proposal_generator(
+                images_k, features_k, None, compute_loss = False
+            )
+            proposals_roih, _ = self.roi_heads(
+                images_k, features, proposals_rpn, targets=None, compute_loss=False, branch='unsup_data_weak'
+            )
+            del proposals_rpn
+
+            features_q_all = [features_q_all[f] for f in self.roi_heads.box_in_features]
+            targets = self.extract_projection_features(
+                features,
+                proposals_roih,
+                prediction=False,
+                box_jitter=box_jitter,
+                jitter_time=jitter_times,
+                jitter_frac=jitter_frac                
+            )
+
+            return {}, _, proposals_roih, _, targets 
+                
+
         
         elif branch == "unsup_forward":
 
@@ -696,12 +742,12 @@ class TwoStagePseudoLabGeneralizedRCNN_cont(GeneralizedRCNN):
             
             return record_all_unlabel_data, [], [], None
 
-    def extract_projection_features(self, image_features, rois, prediction=True, box_jitter=False, jitter_times=1, jitter_frac=0.06, feature_noise=False):
+    def extract_projection_features(self, image_features, rois, prediction=True, box_jitter=False, jitter_times=1, jitter_frac=0.06, feature_noise=False, temp_threshold=0.1):
         total_rois = rois + rois
 
-        predicted_classes = [x.pred_classes[x.scores > 0.1] for x in total_rois]
-        predicted_boxes = [x.pred_boxes[x.scores > 0.1] for x in total_rois]
-        predicted_scores = [x.scores[x.scores > 0.1] for x in total_rois]
+        predicted_classes = [x.pred_classes[x.scores > temp_threshold] for x in total_rois]
+        predicted_boxes = [x.pred_boxes[x.scores > temp_threshold] for x in total_rois]
+        predicted_scores = [x.scores[x.scores > temp_threshold] for x in total_rois]
         
         image_size = [x.image_size for x in total_rois]
 
@@ -743,28 +789,28 @@ class TwoStagePseudoLabGeneralizedRCNN_cont(GeneralizedRCNN):
         source_gt_scores_q, source_gt_scores_q_2 = source_gt_scores.chunk(2)
 
         target_gt_scores = target['gt_scores']
-        target_gt_scores[(target_gt_scores <cont_score_threshold)] = 0.0
+        target_gt_scores[(target_gt_scores < cont_score_threshold)] = 0.0
         # from teacher 
-        with torch.no_grad():
-            target_features_q_2 = torch.zeros(100 * batch_size, 128).to(self.device)
-            target_gt_classes_q_2 = torch.zeros(100 * batch_size).to(self.device).fill_(-1.0)
-            target_gt_scores_q_2 = torch.zeros(100 * batch_size).to(self.device)
+        
+        target_features_q_2 = torch.zeros((100 * batch_size, 128), device=self.device, requires_grad=False)
+        target_gt_classes_q_2 = torch.zeros(100 * batch_size, device=self.device, requires_grad=False).fill_(-1.0)
+        target_gt_scores_q_2 = torch.zeros(100 * batch_size, device=self.device, requires_grad=False)
 
-            num_of_targets = int(target['features'].shape[0] / 2)
-            _, target_features_q_2[:num_of_targets] = target['features'].chunk(2) # (N,128)
-            _, target_gt_classes_q_2[:num_of_targets] = target['gt_classes'].chunk(2) # (N)
-            _, target_gt_scores_q_2[:num_of_targets] = target_gt_scores.chunk(2) #(N)
+        num_of_targets = int(target['features'].shape[0] / 2)
+        _, target_features_q_2[:num_of_targets] = target['features'].chunk(2) # (N,128)
+        _, target_gt_classes_q_2[:num_of_targets] = target['gt_classes'].chunk(2) # (N)
+        _, target_gt_scores_q_2[:num_of_targets] = target_gt_scores.chunk(2) #(N)
 
-            if comm.get_world_size() > 1:
-                target_features_q_2 = concat_all_gather(target_features_q_2)
-                target_gt_classes_q_2 = concat_all_gather(target_gt_classes_q_2)
-                target_gt_scores_q_2 = concat_all_gather(target_gt_scores_q_2)
+        if comm.get_world_size() > 1:
+            target_features_q_2 = concat_all_gather(target_features_q_2)
+            target_gt_classes_q_2 = concat_all_gather(target_gt_classes_q_2)
+            target_gt_scores_q_2 = concat_all_gather(target_gt_scores_q_2)
 
-            valid = (target_gt_classes_q_2 != -1.0)
-            target_features_q_2 = target_features_q_2[valid]
-            target_gt_classes_q_2 = target_gt_classes_q_2[valid]
-            target_gt_scores_q_2 = target_gt_scores_q_2[valid]
-          
+        valid = (target_gt_classes_q_2 != -1.0)
+        target_features_q_2 = target_features_q_2[valid]
+        target_gt_classes_q_2 = target_gt_classes_q_2[valid]
+        target_gt_scores_q_2 = target_gt_scores_q_2[valid]
+        
         if cont_loss_type == 'infoNCE':
             loss_first = self.cont_loss(source_features_q, source_gt_classes_q, source_gt_scores_q, target_features_q_2, target_gt_classes_q_2, target_gt_scores_q_2, temperature, class_aware_cont)
         elif cont_loss_type == 'byol':
@@ -774,25 +820,24 @@ class TwoStagePseudoLabGeneralizedRCNN_cont(GeneralizedRCNN):
 
         del source_features_q, source_gt_classes_q, source_gt_scores_q, target_features_q_2, target_gt_classes_q_2, target_gt_scores_q_2
 
-        with torch.no_grad():
-            target_features_q = torch.zeros(100 * batch_size, 128).to(self.device)
-            target_gt_classes_q = torch.zeros(100 * batch_size).to(self.device).fill_(-1.0)
-            target_gt_scores_q = torch.zeros(100 * batch_size).to(self.device)
+        target_features_q = torch.zeros((100 * batch_size, 128), device=self.device, requires_grad=False)
+        target_gt_classes_q = torch.zeros(100 * batch_size, device=self.device, requires_grad=False).fill_(-1.0)
+        target_gt_scores_q = torch.zeros(100 * batch_size, device=self.device, requires_grad=False)
 
-            num_of_targets = int(target['features'].shape[0] / 2)
-            target_features_q[:num_of_targets], _ = target['features'].chunk(2) # (N,128)
-            target_gt_classes_q[:num_of_targets], _ = target['gt_classes'].chunk(2) # (N)
-            target_gt_scores_q[:num_of_targets], _ = target_gt_scores.chunk(2) #(N)
+        num_of_targets = int(target['features'].shape[0] / 2)
+        target_features_q[:num_of_targets], _ = target['features'].chunk(2) # (N,128)
+        target_gt_classes_q[:num_of_targets], _ = target['gt_classes'].chunk(2) # (N)
+        target_gt_scores_q[:num_of_targets], _ = target_gt_scores.chunk(2) #(N)
 
-            if comm.get_world_size() > 1:
-                target_features_q = concat_all_gather(target_features_q)
-                target_gt_classes_q = concat_all_gather(target_gt_classes_q)
-                target_gt_scores_q = concat_all_gather(target_gt_scores_q)
+        if comm.get_world_size() > 1:
+            target_features_q = concat_all_gather(target_features_q)
+            target_gt_classes_q = concat_all_gather(target_gt_classes_q)
+            target_gt_scores_q = concat_all_gather(target_gt_scores_q)
 
-            valid = (target_gt_classes_q != -1.0)
-            target_features_q = target_features_q[valid]
-            target_gt_classes_q = target_gt_classes_q[valid]
-            target_gt_scores_q = target_gt_scores_q[valid]
+        valid = (target_gt_classes_q != -1.0)
+        target_features_q = target_features_q[valid]
+        target_gt_classes_q = target_gt_classes_q[valid]
+        target_gt_scores_q = target_gt_scores_q[valid]
 
         if cont_loss_type == 'infoNCE':
             loss_second = self.cont_loss(source_features_q_2, source_gt_classes_q_2, source_gt_scores_q_2, target_features_q, target_gt_classes_q, target_gt_scores_q, temperature, class_aware_cont)
@@ -809,7 +854,7 @@ class TwoStagePseudoLabGeneralizedRCNN_cont(GeneralizedRCNN):
 
     # if train model with multi gpus, matrix is not NxN
     def cont_loss(self, source_features, source_gt_classes, source_gt_scores, target_features, target_gt_classes, target_gt_scores, temperature, class_aware_cont):
-        self_mask = torch.zeros(source_features.shape[0], target_features.shape[0]).float().fill_diagonal_(1.0).to(self.device)
+        self_mask = torch.zeros((source_features.shape[0], target_features.shape[0]), device=self.device).float().fill_diagonal_(1.0)
         class_match_mask = torch.eq(source_gt_classes.view(-1,1), target_gt_classes.view(1,-1)).float()
         score_weight = torch.mm(source_gt_scores.view(-1,1), target_gt_scores.view(1,-1))
 

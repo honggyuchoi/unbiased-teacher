@@ -1531,12 +1531,6 @@ class ContROIHeadsPseudoLabUncertainty(StandardROIHeadsPseudoLab):
                 targets_per_image.gt_boxes, proposals_per_image.proposal_boxes
             )
 
-            # iou값 저장하자
-            if match_quality_matrix.numel() == 0:
-                matched_vals = torch.zeros(match_quality_matrix.shape[1]).to(match_quality_matrix.device)
-            else:
-                matched_vals, _ = match_quality_matrix.max(dim=0) # max iou, _
-
             matched_idxs, matched_labels = self.proposal_matcher(match_quality_matrix)
             sampled_idxs, gt_classes = self._sample_proposals(
                 matched_idxs, matched_labels, targets_per_image.gt_classes
@@ -1544,9 +1538,6 @@ class ContROIHeadsPseudoLabUncertainty(StandardROIHeadsPseudoLab):
 
             proposals_per_image = proposals_per_image[sampled_idxs]
             proposals_per_image.gt_classes = gt_classes
-
-            if not proposals_per_image.has('iou'):
-                proposals_per_image.set('iou', matched_vals[sampled_idxs])
 
             if has_gt:
                 sampled_targets = matched_idxs[sampled_idxs]
